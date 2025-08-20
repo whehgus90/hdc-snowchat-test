@@ -1,3 +1,4 @@
-streamlit
-snowflake-connector-python
+streamlit>=1.35
+snowflake-connector-python>=3.7,<4
 pandas
+cryptography>=41,<43
