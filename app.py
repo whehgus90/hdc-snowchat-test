@@ -314,50 +314,82 @@ def _extract_df(payload: dict) -> pd.DataFrame:
         return pd.DataFrame(rows, columns=cols) if cols else pd.DataFrame(rows)
     return pd.DataFrame()
 
-def run_sql_rest(sql: str, timeout_s: int = 90) -> pd.DataFrame | None:
-    if not sql: return None
+def run_sql_rest(sql: str, timeout_s: int = 120) -> pd.DataFrame | None:
+    if not sql:
+        return None
+
     stmt = qualify_sql(sql) if AUTO_QUALIFY else sql
+
+    # 1) 동기 모드로 먼저 시도 (서버가 지원하면 한 방에 결과 수신)
+    params = {"async": "false"}  # block until done
     body = {
         "statement": stmt,
-        "timeout": timeout_s,
-        "resultSetMetaData": { "format": "json" },
+        "timeout": timeout_s,                       # 서버측 실행 타임아웃(초)
+        "resultSetMetaData": {"format": "json"},
         "warehouse": WAREHOUSE,
         "role": ROLE,
         "database": DATABASE,
-        "schema": SCHEMA
+        "schema": SCHEMA,
     }
-    r = requests.post(SQL_ENDPOINT, headers=_sql_headers(), json=body, timeout=timeout_s)
+    r = requests.post(SQL_ENDPOINT, headers=_sql_headers(), params=params, json=body, timeout=timeout_s+10)
+
     if r.status_code != 200:
         st.error(f"SQL HTTP {r.status_code} - {r.reason}")
         st.code(r.text[:2000] or "<empty>", language="json")
         return None
-    resp = r.json()
+
+    try:
+        resp = r.json()
+    except Exception:
+        st.error("SQL 응답 JSON 파싱 실패")
+        st.code(r.text[:2000], language="json")
+        return None
+
     status = (resp.get("status") or "").lower()
+    # 동기 성공
+    if status in ("success", "succeeded", "complete"):
+        return _extract_df(resp)
+
+    # 동기 실패 즉시 표기
+    if status in ("failed", "failed_with_error", "aborted", "cancelled"):
+        err = resp.get("message") or resp.get("errorMessage") or resp.get("code") or json.dumps(resp)[:500]
+        st.error(f"SQL failed: {err}")
+        st.code(stmt, language="sql")
+        return None
+
+    # 2) 어떤 환경에선 async=false를 무시하고 핸들만 돌려줄 수 있음 → 짧게 폴링
     handle = resp.get("statementHandle")
-    if status in ("success","succeeded","complete"):
-        try: return _extract_df(resp)
-        except Exception as e:
-            st.error(f"Result parse error: {e}")
-            st.code(json.dumps(resp)[:1500], language="json")
-            return None
+    if not handle:
+        st.error("SQL: no result and no handle returned.")
+        st.code(json.dumps(resp)[:1500], language="json")
+        return None
+
     get_url = f"{SQL_ENDPOINT}/{handle}"
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        g = requests.get(get_url, headers=_sql_headers(), timeout=timeout_s)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        g = requests.get(get_url, headers=_sql_headers(), timeout=30)
         if g.status_code != 200:
             st.error(f"SQL poll HTTP {g.status_code} - {g.reason}")
             st.code(g.text[:2000] or "<empty>", language="json")
             return None
         pj = g.json()
         stt = (pj.get("status") or "").lower()
-        if stt in ("success","succeeded","complete"):
-            try: return _extract_df(pj)
-            except Exception as e:
-                st.error(f"Result parse error: {e}")
-                st.code(json.dumps(pj)[:1500], language="json")
-                return None
-        time.sleep(0.5)
-    st.error("SQL poll timeout"); return None
+
+        if stt in ("success", "succeeded", "complete"):
+            return _extract_df(pj)
+
+        if stt in ("failed", "failed_with_error", "aborted", "cancelled"):
+            err = pj.get("message") or pj.get("errorMessage") or pj.get("code") or json.dumps(pj)[:500]
+            st.error(f"SQL failed: {err}")
+            st.code(stmt, language="sql")
+            return None
+
+        time.sleep(1.0)
+
+    st.error(f"SQL poll timeout (no completion within {timeout_s}s)")
+    st.code(stmt, language="sql")
+    return None
+
 
 def preview_transcript_rest(doc_id: str) -> tuple[str, str] | None:
     if not doc_id: return None
