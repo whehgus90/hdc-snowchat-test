@@ -25,9 +25,10 @@ SCHEMA       = SF.get("schema",    "DATA")
 # 모델은 서울 리전에 없을 수 있으니 Cross-Region 허용 후, 미국에서 제공되는 걸로 설정
 MODEL_NAME   = st.sidebar.selectbox("Model", ["llama3.3-70b", "mistral-large2"], index=0)
 
-# Quickstart에서 만든 리소스
-CORTEX_SEARCH_SERVICE = f"{DATABASE}.{SCHEMA}.SALES_CONVERSATION_SEARCH".lower()
-SEMANTIC_MODEL_FILE   = f"@{DATABASE}.{SCHEMA}.models/sales_metrics_model.yaml".lower()
+# ✅ 대소문자 유지 + 풀네임
+CORTEX_SEARCH_SERVICE = "SALES_INTELLIGENCE.DATA.SALES_CONVERSATION_SEARCH"
+SEMANTIC_MODEL_FILE   = "@SALES_INTELLIGENCE.DATA.MODELS/sales_metrics_model.yaml"
+
 
 API_ENDPOINT = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
 
@@ -37,16 +38,14 @@ API_ENDPOINT = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
 def build_headers():
     return {
         "Authorization": f"Bearer {PAT}",
-        "Accept": "text/event-stream",  # 서버가 SSE로 보내도록 요청
+        "Accept": "application/json",  # ✅ 임시: 에러 바디를 JSON으로 받기
         "Content-Type": "application/json",
         "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
-        # 컨텍스트를 헤더로 넘길 수 있음(토큰의 기본 설정이 되어 있어도 안전하게 지정)
         "X-Snowflake-Role": ROLE,
         "X-Snowflake-Database": DATABASE,
         "X-Snowflake-Schema": SCHEMA,
         "X-Snowflake-Warehouse": WAREHOUSE,
     }
-
 def build_payload(user_text: str, max_results: int = 5):
     return {
         "model": MODEL_NAME,
@@ -179,7 +178,7 @@ if query:
 
     with st.spinner("Calling Snowflake Agents..."):
         payload = build_payload(query, max_results=max_results)
-        resp = requests.post(API_ENDPOINT, headers=build_headers(), data=json.dumps(payload), stream=True)
+        resp = requests.post(API_ENDPOINT, headers=build_headers(), data=json.dumps(payload))  # ✅ stream 제거
 
         if resp.status_code != 200:
             st.error(f"HTTP {resp.status_code} — {resp.reason}")
