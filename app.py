@@ -66,83 +66,103 @@ def build_payload(user_text: str, max_results: int = 5):
         }
     }
 
-def parse_streaming_response(resp: requests.Response):
+def parse_streaming_response(events):
     """
-    SSE 스트림을 읽어 텍스트/SQL/서치결과(인용)들을 추출.
+    events: requests.Response (SSE), list[dict] (이벤트 배열), dict/json 문자열 등
+    return: (text, sql, citations)
     """
     text_chunks = []
-    sql_text = None
     citations = []
+    sql_holder = {"value": None}  # 클로저로 SQL 담는 컨테이너
 
-    last_event = None
-    for raw in resp.iter_lines(decode_unicode=True):
-        if not raw:
-            continue
-        line = raw.strip()
-        if line.startswith("event:"):
-            last_event = line.split("event:", 1)[1].strip()
-            continue
-        if not line.startswith("data:"):
-            continue
+    def set_sql(v: str | None):
+        if v and isinstance(v, str) and v.strip():
+            sql_holder["value"] = v
 
-        data_str = line[5:].strip()
-        # 일부 환경에서 keepalive로 "data: [DONE]" 이 올 수 있음
-        if data_str == "[DONE]":
-            break
-
-        try:
-            payload = json.loads(data_str)
-        except Exception:
-            # 혹시 배열형 이벤트(JSON array)로 올 경우 처리
-            try:
-                arr = json.loads(data_str if data_str.startswith("[") else f"[{data_str}]")
-            except Exception:
+    # 1) requests.Response (SSE 스트림)
+    if hasattr(events, "iter_lines"):
+        for raw in events.iter_lines():
+            if not raw:
                 continue
-            for evt in arr:
-                handle_event_object(evt, text_chunks, citations, lambda s: set_sql(s))
-            continue
+            # SSE 포맷: b"data: {...}"
+            if raw.startswith(b"data: "):
+                payload = raw[6:]
+                try:
+                    evt_obj = json.loads(payload)
+                    handle_event_object(evt_obj, text_chunks, citations, set_sql)
+                except Exception:
+                    # 에러 이벤트/하트비트 등은 무시
+                    pass
 
-        # 표준 SSE 경로: last_event 를 보고 처리
-        evt_obj = {"event": last_event, "data": payload}
-        handle_event_object(evt_obj, text_chunks, citations, lambda s: set_sql(s))
+    # 2) 이미 파싱된 리스트/딕셔너리
+    elif isinstance(events, list):
+        for evt_obj in events:
+            handle_event_object(evt_obj, text_chunks, citations, set_sql)
+    elif isinstance(events, dict):
+        handle_event_object(events, text_chunks, citations, set_sql)
 
-    # 내부 클로저에서 sql_text 갱신
-    return ("".join(text_chunks).strip(), sql_text, citations)
+    # 3) 문자열(JSON)일 수도 있음
+    elif isinstance(events, str):
+        try:
+            obj = json.loads(events)
+            if isinstance(obj, list):
+                for evt_obj in obj:
+                    handle_event_object(evt_obj, text_chunks, citations, set_sql)
+            elif isinstance(obj, dict):
+                handle_event_object(obj, text_chunks, citations, set_sql)
+        except Exception:
+            pass
 
-    # 내부 도우미들
-    def set_sql(s):
-        nonlocal sql_text
-        sql_text = s if s else sql_text
+    return "".join(text_chunks).strip(), sql_holder["value"], citations
 
-def handle_event_object(evt_obj, text_chunks, citations, set_sql_fn):
+def handle_event_object(evt_obj: dict, text_chunks: list[str], citations: list[dict], set_sql_fn):
     """
-    message.delta 이벤트 안의 delta.content를 풀어 텍스트/툴결과를 추출
+    한 개의 SSE 이벤트 객체 처리
     """
-    if not evt_obj or evt_obj.get("event") != "message.delta":
-        # error/done 등은 여기서 무시 (필요시 화면에 표시 가능)
+    ev = evt_obj.get("event")
+
+    # 에러 이벤트는 예외로 올려서 상위에서 표시
+    if ev == "error":
+        err = evt_obj.get("data", {})
+        raise RuntimeError(err.get("message", "Unknown error from SSE"))
+
+    # Delta 타입만 처리 (이름이 약간 다를 수 있어 유연 처리)
+    if ev not in ("message.delta", "response.delta", "chunk.delta"):
         return
+
     data = evt_obj.get("data", {})
     delta = data.get("delta", {})
-    for c in delta.get("content", []):
-        ctype = c.get("type")
-        if ctype == "text":
-            text_chunks.append(c.get("text", ""))
-        elif ctype == "tool_results":
-            tr = c.get("tool_results", {})
-            for item in tr.get("content", []):
-                if item.get("type") == "json":
-                    j = item.get("json", {})
-                    # Agents가 반환하는 구조: {"text": "...", "sql": "...", "searchResults":[...]}
-                    if "text" in j and isinstance(j["text"], str):
-                        text_chunks.append(j["text"])
-                    if "sql" in j and isinstance(j["sql"], str) and j["sql"]:
+    contents = delta.get("content", [])
+
+    # content가 dict로 오는 경우도 방어
+    if isinstance(contents, dict):
+        contents = [contents]
+
+    for item in contents:
+        t = item.get("type")
+        if t == "text":
+            text_chunks.append(item.get("text", ""))
+
+        elif t == "tool_results":
+            tr = item.get("tool_results", {})
+            for result in tr.get("content", []):
+                if result.get("type") == "json":
+                    j = result.get("json", {})
+                    # json이 문자열로 오는 경우도 있음
+                    if isinstance(j, str):
+                        try:
+                            j = json.loads(j)
+                        except Exception:
+                            j = {}
+                    # SQL 추출
+                    if isinstance(j, dict) and j.get("sql"):
                         set_sql_fn(j["sql"])
-                    if "searchResults" in j and isinstance(j["searchResults"], list):
-                        for r in j["searchResults"]:
-                            citations.append({
-                                "source_id": r.get("source_id", ""),
-                                "doc_id": r.get("doc_id", "")
-                            })
+                    # 검색 인용 문서 추출
+                    for s in j.get("searchResults", []) if isinstance(j, dict) else []:
+                        citations.append({
+                            "source_id": s.get("source_id", ""),
+                            "doc_id": s.get("doc_id", "")
+                        })
 
 # -------------------------------
 # Session state
