@@ -1,51 +1,41 @@
-# app.py — Streamlit Cloud Ready (PAT + REST + SSE 파서 + 영구 히스토리 + 커넥터 상태)
-# 필요 패키지: streamlit, requests, pandas, snowflake-connector-python
+# app.py — Streamlit Cloud (PAT only: Agents + SQL API + SSE + Persisted Chat)
+# req: streamlit, requests, pandas
 
-import json, re, requests, pandas as pd, streamlit as st
-from snowflake import connector as sf
+import json, re, time, requests, pandas as pd, streamlit as st
 
 # ---------------------------
 # App config
 # ---------------------------
 st.set_page_config(page_title="❄️ SNOW챗봇 (Cortex Agents)", page_icon="❄️", layout="wide")
-st.title("❄️ SNOW챗봇 - Cortex Agents (Cloud)")
-st.caption("Cortex Search for calls · Analyst for metrics · Persistent chat")
+st.title("❄️ SNOW챗봇 - Cortex Agents (Cloud / PAT only)")
+st.caption("Cortex Search for calls · Analyst for metrics · SQL via REST · Persistent chat")
 
 # ---------------------------
-# Secrets (Streamlit Cloud에 설정)
+# Secrets (Streamlit Cloud)
 # ---------------------------
 SF = st.secrets["snowflake"]
-ACCOUNT_BASE = SF["account_base"].rstrip("/")  # https://<acct>.<region>.<cloud>.snowflakecomputing.com (regionless도 OK)
-PAT          = SF["pat"]                       # Programmatic Access Token
+ACCOUNT_BASE = SF["account_base"].rstrip("/")   # ex) https://qnehhfk-rub23142.snowflakecomputing.com  (regionless 권장)
+PAT          = SF["pat"]                        # Programmatic Access Token
 ROLE         = SF.get("role", "SALES_INTELLIGENCE_RL")
 WAREHOUSE    = SF.get("warehouse", "SALES_INTELLIGENCE_WH")
 DATABASE     = SF.get("database",  "SALES_INTELLIGENCE")
 SCHEMA       = SF.get("schema",    "DATA")
 
-# (SQL 실행용 커넥터 자격 — 있으면 결과 테이블 & 미리보기 제공)
-SF_USER      = SF.get("user")
-SF_PASSWORD  = SF.get("password")
-SF_ACCOUNT   = SF.get("account")   # 예: qnehhfk-rub23142  (regionless 권장)
-
 # 모델 선택(리전에 맞게)
 MODEL_NAME = st.sidebar.selectbox("Model", ["mistral-large2", "llama3.3-70b"], index=0)
 
-# 항상 적용되는 동작
+# 항상 적용
 AUTO_RUN_SQL = True
 AUTO_QUALIFY = True
 
 # 리소스 이름(FQN)
 CORTEX_SEARCH_SERVICE = "SALES_INTELLIGENCE.DATA.SALES_CONVERSATION_SEARCH"
 SEMANTIC_MODEL_FILE   = "@SALES_INTELLIGENCE.DATA.MODELS/sales_metrics_model.yaml"
-API_ENDPOINT          = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
-
-with st.sidebar:
-    if st.button("New Conversation"):
-        st.session_state.messages = []
-        st.rerun()
+AGENTS_ENDPOINT       = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
+SQL_ENDPOINT          = f"{ACCOUNT_BASE}/api/v2/statements"
 
 # ---------------------------
-# FQN 보정
+# Utils
 # ---------------------------
 _TABLE_FQN = {
     "SALES_CONVERSATIONS": "SALES_INTELLIGENCE.DATA.SALES_CONVERSATIONS",
@@ -57,83 +47,24 @@ def qualify_sql(sql: str) -> str:
         s = re.sub(rf"(?<!\.)\b{short}\b", fqn, s, flags=re.IGNORECASE)
     return s
 
-# ---------------------------
-# Connector 상태/이유 보이기 + 연결 함수
-# ---------------------------
-def _missing_secret_keys():
-    miss = []
-    if not SF_USER:     miss.append("user")
-    if not SF_PASSWORD: miss.append("password")
-    if not SF_ACCOUNT:  miss.append("account")
-    return miss
+def _normalize_text(s: str) -> str:
+    s = s.replace("\r\n", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.replace("【†","[").replace("†】","]").strip()
 
-@st.cache_resource(show_spinner=False)
-def get_conn():
-    """
-    SQL 커넥터가 실패해도 앱이 죽지 않음.
-    실패 사유는 session_state['sql_disabled_reason']에 저장.
-    """
-    miss = _missing_secret_keys()
-    if miss:
-        st.session_state["sql_disabled_reason"] = f"missing secrets: {', '.join(miss)}"
-        return None
-    try:
-        return sf.connect(
-            user=SF_USER,
-            password=SF_PASSWORD,
-            account=SF_ACCOUNT,               # 예: qnehhfk-rub23142  (regionless 추천)
-            warehouse=WAREHOUSE,
-            database=DATABASE,
-            schema=SCHEMA,
-            role=ROLE,
-            authenticator="snowflake",        # 중요!
-            session_parameters={"CLIENT_SESSION_KEEP_ALIVE": True},
-        )
-    except Exception as e:
-        # Streamlit Cloud가 상세를 가릴 수 있으니 앞부분만 저장
-        st.session_state["sql_disabled_reason"] = str(e)[:500]
-        return None
-
-def run_sql(sql: str) -> pd.DataFrame | None:
-    conn = get_conn()
-    if conn is None:
-        return None
-    q = qualify_sql(sql) if sql else sql
-    try:
-        with conn.cursor() as cur:
-            cur.execute(q)
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-        return pd.DataFrame(rows, columns=cols)
-    except Exception as e:
-        st.error(f"❌ SQL 실행 에러: {e}")
-        st.markdown("**Original SQL**"); st.code(sql or "<empty>", language="sql")
-        if q and q != sql:
-            st.markdown("**Qualified SQL (FQN 보정)**"); st.code(q, language="sql")
-        return None
+def _headers_common():
+    return {
+        "Authorization": f"Bearer {PAT}",
+        "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+        "X-Snowflake-Role": ROLE,
+        "X-Snowflake-Database": DATABASE,
+        "X-Snowflake-Schema": SCHEMA,
+        "X-Snowflake-Warehouse": WAREHOUSE,
+    }
 
 # ---------------------------
-# Connector 상태 패널
-# ---------------------------
-with st.expander("SQL Connector Status", expanded=False):
-    miss = _missing_secret_keys()
-    conn = get_conn()
-    if miss:
-        st.error("🔒 SQL connector disabled: " + f"missing secrets: {', '.join(miss)}")
-        st.caption("Streamlit Cloud → App → Settings → Secrets에서 snowflake.user/password/account 추가하세요.")
-    elif conn is None:
-        st.error("🔒 SQL connector disabled: " + st.session_state.get("sql_disabled_reason", "unknown"))
-        st.caption("계정/비밀번호/네트워크 정책을 확인하세요.")
-    else:
-        try:
-            ok = run_sql("SELECT 1 AS ok")
-            if ok is not None and not ok.empty:
-                st.success("✅ Connected")
-        except Exception as e:
-            st.error(f"Connector check failed: {e}")
-
-# ---------------------------
-# 라우팅 휴리스틱 (Search ↔ SQL)
+# Agents (JSON/SSE 둘다 지원)
 # ---------------------------
 _SEARCH_HINTS = {
     "call","calls","conversation","conversations","transcript","transcripts",
@@ -151,34 +82,7 @@ def detect_intent(q: str) -> str:
         return "SQL"
     return "Auto"
 
-# ---------------------------
-# 텍스트 정리
-# ---------------------------
-def _normalize_text(s: str) -> str:
-    s = s.replace("\r\n", "\n")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    # 인용 표식(【†1†】) 정규화
-    s = s.replace("【†", "[").replace("†】", "]")
-    return s.strip()
-
-# ---------------------------
-# Agents REST 호출 (JSON + SSE 모두 지원, UTF-8 강제)
-# ---------------------------
-def build_headers():
-    # 헤더에는 ASCII만 들어가야 함 (PAT, Role 등은 ASCII)
-    return {
-        "Authorization": f"Bearer {PAT}",
-        "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
-        "X-Snowflake-Role": ROLE,
-        "X-Snowflake-Database": DATABASE,
-        "X-Snowflake-Schema": SCHEMA,
-        "X-Snowflake-Warehouse": WAREHOUSE,
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-    }
-
-def build_payload(user_text: str, max_results: int = 5) -> dict:
+def build_agents_payload(user_text: str, max_results: int = 5) -> dict:
     intent = detect_intent(user_text)
     use_search = intent in ("Auto", "Search")
     use_sql    = intent in ("Auto", "SQL")
@@ -206,7 +110,7 @@ def build_payload(user_text: str, max_results: int = 5) -> dict:
     else:
         sys_text = ("You are a helpful assistant. "
                     "For conversations/calls/transcripts, use cortex_search to retrieve and summarize. "
-                    "For metrics/counts/aggregates, use cortex_analyst_text_to_sql to generate SQL. "
+                    "For metrics/aggregations, use cortex_analyst_text_to_sql to generate SQL. "
                     "Always include a short natural language answer.")
 
     return {
@@ -219,29 +123,29 @@ def build_payload(user_text: str, max_results: int = 5) -> dict:
         "tool_resources": tool_resources,
     }
 
-def call_agents_rest(payload: dict, timeout: int = 90):
-    r = requests.post(API_ENDPOINT, headers=build_headers(), json=payload, timeout=timeout)
-    ctype = r.headers.get("Content-Type", "")
+def call_agents(payload: dict, timeout: int = 90):
+    headers = {**_headers_common(),
+               "Accept": "application/json, text/event-stream",
+               "Content-Type": "application/json"}
+    r = requests.post(AGENTS_ENDPOINT, headers=headers, json=payload, timeout=timeout)
+    ctype = r.headers.get("Content-Type","")
     st.write(f"DEBUG: HTTP {r.status_code}, Content-Type={ctype}")
-
     if r.status_code != 200:
         st.error(f"HTTP {r.status_code} - {r.reason}")
         st.code(r.text[:2000] or "<empty>", language="json")
         return None
 
-    # 1) JSON 응답
     if "application/json" in ctype:
         try:
             return r.json()
         except Exception:
-            st.error("JSON 파싱 실패 → Raw 응답 표시")
-            st.code(r.text[:2000] or "<empty>", language="json")
+            st.error("JSON parse failed"); st.code(r.text[:2000], language="json")
             return None
 
-    # 2) SSE 응답: bytes → UTF-8로 강제 디코드 (모지바케 방지)
     if "text/event-stream" in ctype:
+        # UTF-8 강제
         body_text = r.content.decode("utf-8", errors="replace")
-        # 간단 SSE 파서: event:/data: 블록 분해 → message.delta만 정규화
+        # 간단 SSE 파서
         events, cur_event, data_lines = [], None, []
         for line in body_text.splitlines() + [""]:
             if line.startswith("event:"):
@@ -249,33 +153,21 @@ def call_agents_rest(payload: dict, timeout: int = 90):
                     data_str = "\n".join(data_lines).strip()
                     try: data_json = json.loads(data_str) if data_str else {}
                     except: data_json = {"raw": data_str}
-                    if cur_event.startswith("message"):
-                        events.append({"event":"message.delta","data":{"delta":data_json.get("delta",data_json)}})
-                    else:
-                        events.append({"event":cur_event,"data":data_json})
+                    events.append({"event":cur_event,"data":data_json})
                 cur_event, data_lines = line.split("event:",1)[1].strip(), []
             elif line.startswith("data:"):
                 data_lines.append(line[5:].strip())
-            elif line.strip() == "":
-                if cur_event is not None:
-                    data_str = "\n".join(data_lines).strip()
-                    try: data_json = json.loads(data_str) if data_str else {}
-                    except: data_json = {"raw": data_str}
-                    if cur_event.startswith("message"):
-                        events.append({"event":"message.delta","data":{"delta":data_json.get("delta",data_json)}})
-                    else:
-                        events.append({"event":cur_event,"data":data_json})
-                    cur_event, data_lines = None, []
+            elif line.strip() == "" and cur_event is not None:
+                data_str = "\n".join(data_lines).strip()
+                try: data_json = json.loads(data_str) if data_str else {}
+                except: data_json = {"raw": data_str}
+                events.append({"event":cur_event,"data":data_json})
+                cur_event, data_lines = None, []
         return events
 
-    # 3) 기타 → 원문
-    st.error("알 수 없는 응답 형식 → Raw 바디 앞부분 표시")
-    st.code(r.text[:2000] or "<empty>")
+    st.error("Unknown response type"); st.code(r.text[:2000] or "<empty>")
     return None
 
-# ---------------------------
-# 응답 파싱
-# ---------------------------
 def _pull_from_tool_result(result_obj, citations, set_sql_fn):
     if not isinstance(result_obj, dict): return
     j = result_obj.get("json")
@@ -289,13 +181,14 @@ def _pull_from_tool_result(result_obj, citations, set_sql_fn):
             set_sql_fn(v); break
     for s in j.get("searchResults") or j.get("results") or []:
         if isinstance(s, dict):
-            citations.append({"source_id": s.get("source_id",""),
-                              "doc_id":    s.get("doc_id","") or s.get("id","")})
+            citations.append({
+                "source_id": s.get("source_id",""),
+                "doc_id":    s.get("doc_id","") or s.get("id","")
+            })
 
 def parse_json_response(obj: dict):
-    text_parts, citations = [], []
-    sql_holder = {"v": None}
-    def set_sql(v):
+    text_parts, citations, sql_holder = [], [], {"v": None}
+    def set_sql(v): 
         if v and isinstance(v,str) and v.strip(): sql_holder["v"] = v
     def pull(content):
         if isinstance(content, dict): content = [content]
@@ -314,20 +207,18 @@ def parse_json_response(obj: dict):
             pull(node["content"])
     if not text_parts and "content" in obj:
         pull(obj["content"])
-    text = _normalize_text("".join(text_parts))
-    return text, sql_holder["v"], citations
+    return _normalize_text("".join(text_parts)), sql_holder["v"], citations
 
 def parse_events_response(events: list):
-    text_parts, citations = [], []
-    sql_holder = {"v": None}
+    text_parts, citations, sql_holder = [], [], {"v": None}
     def set_sql(v):
         if v and isinstance(v,str) and v.strip() and not sql_holder["v"]:
             sql_holder["v"] = v
     for ev in events:
         if not isinstance(ev, dict): continue
-        if ev.get("event") == "message.delta":
-            delta = ev.get("data",{}).get("delta",{})
-            content = delta.get("content") or []
+        if ev.get("event","").startswith("message"):
+            delta = ev.get("data",{}).get("delta", ev.get("data",{}))
+            content = (delta.get("content") if isinstance(delta, dict) else None) or []
             if isinstance(content, dict): content = [content]
             for item in content:
                 if item.get("type") == "text":
@@ -336,8 +227,7 @@ def parse_events_response(events: list):
                 elif item.get("type") == "tool_results":
                     for r in item.get("tool_results",{}).get("content",[]):
                         _pull_from_tool_result(r, citations, set_sql)
-    text = _normalize_text("".join(text_parts))
-    return text, sql_holder["v"], citations
+    return _normalize_text("".join(text_parts)), sql_holder["v"], citations
 
 def parse_any(resp):
     if resp is None: return "", None, []
@@ -346,12 +236,103 @@ def parse_any(resp):
     return "", None, []
 
 # ---------------------------
-# Chat state (히스토리 + 테이블/인용 보존)
+# SQL API (PAT) — 실행/폴링/프리뷰
+# ---------------------------
+def _sql_headers():
+    return {**_headers_common(),
+            "Accept": "application/json",
+            "Content-Type": "application/json"}
+
+def _extract_df(payload: dict) -> pd.DataFrame:
+    rowset = payload.get("resultSet",{}).get("rows") or payload.get("data","")
+    # SQL API v2: rowType + rowset (배열) 포맷도 있음
+    row_type = payload.get("resultSet",{}).get("rowType")
+    if row_type and isinstance(rowset, list) and rowset and isinstance(rowset[0], list):
+        cols = [c["name"] for c in row_type]
+        return pd.DataFrame(rowset, columns=cols)
+    # 통합 호환 처리
+    if "data" in payload and isinstance(payload["data"], dict):
+        rowset = payload["data"].get("rowset", [])
+        cols   = [c["name"] for c in payload["data"].get("rowType", [])]
+        return pd.DataFrame(rowset, columns=cols) if cols else pd.DataFrame(rowset)
+    return pd.DataFrame(rowset)
+
+def run_sql_rest(sql: str, timeout_s: int = 90) -> pd.DataFrame | None:
+    if not sql: 
+        return None
+    stmt = qualify_sql(sql) if AUTO_QUALIFY else sql
+    body = {
+        "statement": stmt,
+        "timeout": timeout_s,
+        "resultSetMetaData": { "format": "json" },
+        "warehouse": WAREHOUSE,
+        "role": ROLE,
+        "database": DATABASE,
+        "schema": SCHEMA
+    }
+    r = requests.post(SQL_ENDPOINT, headers=_sql_headers(), json=body, timeout=timeout_s)
+    if r.status_code != 200:
+        st.error(f"SQL HTTP {r.status_code} - {r.reason}")
+        st.code(r.text[:2000] or "<empty>", language="json")
+        return None
+    resp = r.json()
+    status = (resp.get("status") or "").lower()
+    handle = resp.get("statementHandle")
+
+    # 즉시 결과가 올 때
+    if status in ("success","succeeded","complete"):
+        try:
+            return _extract_df(resp)
+        except Exception as e:
+            st.error(f"Result parse error: {e}")
+            st.code(json.dumps(resp)[:1500], language="json")
+            return None
+
+    # 폴링
+    get_url = f"{SQL_ENDPOINT}/{handle}"
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        g = requests.get(get_url, headers=_sql_headers(), timeout=timeout_s)
+        if g.status_code != 200:
+            st.error(f"SQL poll HTTP {g.status_code} - {g.reason}")
+            st.code(g.text[:2000] or "<empty>", language="json")
+            return None
+        pj = g.json()
+        stt = (pj.get("status") or "").lower()
+        if stt in ("success","succeeded","complete"):
+            try:
+                return _extract_df(pj)
+            except Exception as e:
+                st.error(f"Result parse error: {e}")
+                st.code(json.dumps(pj)[:1500], language="json")
+                return None
+        time.sleep(0.6)
+    st.error("SQL poll timeout")
+    return None
+
+def preview_transcript_rest(doc_id: str) -> tuple[str, str] | None:
+    if not doc_id: return None
+    doc_id_esc = doc_id.replace("'", "''")
+    sql = f"""
+    SELECT CONVERSATION_ID, CUSTOMER_NAME, SALES_REP, DEAL_STAGE,
+           CONVERSATION_DATE, DEAL_VALUE, PRODUCT_LINE, TRANSCRIPT_TEXT
+    FROM SALES_INTELLIGENCE.DATA.SALES_CONVERSATIONS
+    WHERE CONVERSATION_ID = '{doc_id_esc}'
+    """
+    df = run_sql_rest(sql)
+    if df is None or df.empty: 
+        return None
+    row = df.iloc[0].to_dict()
+    header = f"[{row.get('CONVERSATION_ID','')}] {row.get('CUSTOMER_NAME','')} · {row.get('SALES_REP','')} · {row.get('DEAL_STAGE','')} · {row.get('CONVERSATION_DATE','')}"
+    body   = row.get("TRANSCRIPT_TEXT","(no transcript)")
+    return header, body
+
+# ---------------------------
+# Chat state (history persists)
 # ---------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# 히스토리 렌더링
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m.get("content",""))
@@ -363,28 +344,21 @@ for m in st.session_state.messages:
                 st.write(ex.get("body",""))
 
 # ---------------------------
-# 입력 & 호출
+# Input & Call
 # ---------------------------
 query = st.chat_input("Ask anything. (ex) Tell me about the call with SecureBank?  /  How many deals did Sarah Johnson win vs lost?)")
 if not query:
     st.stop()
 
-# 사용자 메시지 저장/표시
 st.session_state.messages.append({"role":"user","content":query})
 with st.chat_message("user"):
     st.markdown(query)
 
-# 에이전트 호출
 with st.spinner("Calling Cortex Agents..."):
-    try:
-        body = call_agents_rest(build_payload(query, max_results=5), timeout=90)
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+    resp = call_agents(build_agents_payload(query, max_results=5), timeout=90)
 
-text, sql, citations = parse_any(body)
+text, sql, citations = parse_any(resp)
 
-# 어시스턴트 메시지 구성 + 첨부들(테이블/expander)도 함께 저장
 assistant_chunks, tables_to_persist, expanders_to_persist = [], [], []
 
 if text:
@@ -393,49 +367,28 @@ if text:
 if sql:
     assistant_chunks.append("### Generated SQL\n```sql\n" + sql.strip() + "\n```")
     if AUTO_RUN_SQL:
-        df = run_sql(sql)
+        df = run_sql_rest(sql)
         if df is not None:
             st.write("### Query Result")
             st.dataframe(df, use_container_width=True)
-            # 히스토리에 저장
+            # persist
             df_safe = df.astype(str)
-            tables_to_persist.append({
-                "title": "Query Result",
-                "data": df_safe.to_dict(orient="records")
-            })
-            assistant_chunks.append(f"_Query returned **{len(df)}** row(s)._")
-        else:
-            reason = st.session_state.get("sql_disabled_reason")
-            if reason:
-                st.info(f"🔒 SQL connector disabled: {reason}")
+            tables_to_persist.append({"title":"Query Result","data":df_safe.to_dict(orient="records")})
 
-# Citations: 커넥터가 있어야 전문 미리보기 가능
+# Citations → 원문 미리보기(REST SQL)
 if citations:
     ids = [c.get("doc_id","") for c in citations if c.get("doc_id")]
     if ids:
         assistant_chunks.append("**Citations:** " + ", ".join(f"`{i}`" for i in ids))
-    conn_ready = get_conn() is not None
-    if conn_ready:
         for doc_id in ids:
-            preview_sql = f"""
-            SELECT CONVERSATION_ID, CUSTOMER_NAME, SALES_REP, DEAL_STAGE,
-                   CONVERSATION_DATE, DEAL_VALUE, PRODUCT_LINE, TRANSCRIPT_TEXT
-            FROM SALES_INTELLIGENCE.DATA.SALES_CONVERSATIONS
-            WHERE CONVERSATION_ID = '{doc_id.replace("'", "''")}';
-            """
-            dfp = run_sql(preview_sql)
-            if dfp is None or dfp.empty:
+            preview = preview_transcript_rest(doc_id)
+            if not preview: 
                 continue
-            row = dfp.iloc[0].to_dict()
-            header = f"[{row.get('CONVERSATION_ID','')}] {row.get('CUSTOMER_NAME','')} · {row.get('SALES_REP','')} · {row.get('DEAL_STAGE','')} · {row.get('CONVERSATION_DATE','')}"
-            body_text = row.get("TRANSCRIPT_TEXT","(no transcript)")
+            header, body = preview
             with st.expander(header):
-                st.write(body_text)
-            expanders_to_persist.append({"header": header, "body": body_text})
-    else:
-        # 연결이 없으면, ID만 표기하고 안내
-        if ids:
-            assistant_chunks.append("_Add `user/password/account` in secrets to open transcript previews._")
+                st.write(body)
+            # persist
+            expanders_to_persist.append({"header": header, "body": body})
 
 assistant_text = "\n\n".join(assistant_chunks).strip() if assistant_chunks else "_No answer returned._"
 assistant_msg = {"role":"assistant","content":assistant_text,"tables":tables_to_persist,"expanders":expanders_to_persist}
