@@ -62,6 +62,7 @@ def get_conn():
     return sf.connect(
         user=SF_USER, password=SF_PASSWORD, account=SF_ACCOUNT,
         warehouse=WAREHOUSE, database=DATABASE, schema=SCHEMA, role=ROLE,
+        authenticator="snowflake",
         session_parameters={"CLIENT_SESSION_KEEP_ALIVE": True},
     )
 
