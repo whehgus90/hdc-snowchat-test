@@ -1,4 +1,4 @@
-# app.py — Streamlit Cloud (PAT only: Agents + SQL REST + Robust SSE + Persisted Chat)
+# app.py — Streamlit Cloud (PAT only) · Force JSON, Robust SSE, SQL via REST, Persistent chat
 
 import json, re, time, requests, pandas as pd, streamlit as st
 
@@ -7,10 +7,10 @@ import json, re, time, requests, pandas as pd, streamlit as st
 # ---------------------------
 st.set_page_config(page_title="❄️ SNOW챗봇 (Cortex Agents)", page_icon="❄️", layout="wide")
 st.title("❄️ SNOW챗봇 - Cortex Agents (Cloud / PAT only)")
-st.caption("Cortex Search for calls · Analyst for metrics · SQL via REST · Persistent chat")
+st.caption("Cortex Search (calls) · Analyst (metrics) · SQL via REST · Persistent chat")
 
 # ---------------------------
-# Secrets (Streamlit Cloud)
+# Secrets (Streamlit Cloud -> secrets.toml)
 # ---------------------------
 SF = st.secrets["snowflake"]
 ACCOUNT_BASE = SF["account_base"].rstrip("/")
@@ -20,10 +20,10 @@ WAREHOUSE    = SF.get("warehouse", "SALES_INTELLIGENCE_WH")
 DATABASE     = SF.get("database",  "SALES_INTELLIGENCE")
 SCHEMA       = SF.get("schema",    "DATA")
 
-# 모델(리전에 맞게)
+# 모델
 MODEL_NAME = st.sidebar.selectbox("Model", ["mistral-large2", "llama3.3-70b"], index=0)
 
-# 고정 동작
+# 항상 적용
 AUTO_RUN_SQL = True
 AUTO_QUALIFY = True
 
@@ -34,7 +34,7 @@ AGENTS_ENDPOINT       = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
 SQL_ENDPOINT          = f"{ACCOUNT_BASE}/api/v2/statements"
 
 # ---------------------------
-# Utils
+# Helpers
 # ---------------------------
 _TABLE_FQN = {
     "SALES_CONVERSATIONS": "SALES_INTELLIGENCE.DATA.SALES_CONVERSATIONS",
@@ -123,34 +123,49 @@ def build_agents_payload(user_text: str, max_results: int = 5) -> dict:
         ],
         "tools": tools,
         "tool_resources": tool_resources,
-        "stream": False,   # ← JSON 응답 강제
+        "stream": False,   # JSON 응답 강제
     }
 
 # ---------------------------
-# Agents call (JSON 우선, 그래도 SSE면 파싱)
+# Agents call (JSON 고집 + SSE 완전대응 + Raw fallback)
 # ---------------------------
 def call_agents(payload: dict, timeout: int = 90):
     headers = {**_headers_common(),
-               "Accept": "application/json, text/event-stream",
+               # ★여기 핵심: JSON만 명시해서 SSE 강제 방지
+               "Accept": "application/json",
                "Content-Type": "application/json"}
-    r = requests.post(AGENTS_ENDPOINT, headers=headers, json=payload, timeout=timeout)
+    # ★그리고 혹시 모를 서버 기본값 방지로 stream=false 쿼리도 동시 전달
+    r = requests.post(AGENTS_ENDPOINT, headers=headers, params={"stream":"false"}, json=payload, timeout=timeout)
     ctype = r.headers.get("Content-Type","")
     st.write(f"DEBUG: HTTP {r.status_code}, Content-Type={ctype}")
     if r.status_code != 200:
         st.error(f"HTTP {r.status_code} - {r.reason}")
         st.code(r.text[:2000] or "<empty>", language="json")
         return None
+
+    # 1) JSON이면 그대로
     if "application/json" in ctype:
         try:
             return r.json()
         except Exception:
             st.error("JSON parse failed"); st.code(r.text[:2000], language="json")
             return None
-    # 일부 테넌트가 여전히 SSE 반환할 수 있음
-    body_text = r.content.decode("utf-8", errors="replace")
-    if "text/event-stream" in ctype or body_text.startswith("event:"):
-        return _parse_sse_to_events(body_text)
-    return {"content":[{"type":"text","text": body_text[:500]}]}  # 마지막 수단
+
+    # 2) 혹시 여전히 SSE로 내려왔다면 — 초강력 파서 + Raw fallback
+    body = r.content.decode("utf-8", errors="replace")
+    if "text/event-stream" in ctype or body.startswith("event:") or "\ndata:" in body:
+        events = _parse_sse_to_events(body)
+        if not events:
+            # Raw 보여주기라도 하자
+            st.error("SSE body could not be parsed; showing raw snippet.")
+            st.code(body[:2000], language="text")
+            return None
+        return events
+
+    # 3) 알 수 없는 응답 → 원문 노출
+    st.error("Unknown response type; showing raw snippet.")
+    st.code((r.text or "")[:2000], language="text")
+    return None
 
 def _parse_sse_to_events(body_text: str) -> list:
     events, cur_event, data_lines = [], None, []
@@ -172,17 +187,37 @@ def _flush_event(events, cur_event, data_lines):
         data_json = json.loads(data_str) if data_str else {}
     except Exception:
         data_json = {"raw": data_str}
-    # 통합: message.delta / message_start / output_text.delta 등 변형 대응
-    if cur_event.startswith("message"):
+    # 다양한 이벤트명을 message.delta로 표준화
+    name = cur_event.lower()
+    if name.startswith("message"):
         events.append({"event": "message.delta", "data": data_json})
-    elif cur_event.startswith("output_text"):
-        events.append({"event": "message.delta", "data": {"delta": {"content":[{"type":"text","text": data_json.get("text","")}]}}})
+    elif name.startswith("output_text"):
+        txt = data_json.get("text") or data_json.get("delta",{}).get("text")
+        events.append({"event": "message.delta", "data": {"delta": {"content":[{"type":"text","text": txt or ""}]}}})
     else:
-        events.append({"event": cur_event, "data": data_json})
+        events.append({"event": "message.delta", "data": {"delta": data_json}})
 
 # ---------------------------
-# Parse (JSON + SSE 모두)
+# Parse (JSON + SSE + 초강력 스캐너)
 # ---------------------------
+def _walk_any_text(obj, bag):
+    """JSON 어디에 있든 'text'류 문자열 긁어모으기"""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in ("text","answer","output","summary") and isinstance(v, str):
+                bag.append(v)
+            elif k == "content":
+                if isinstance(v, list):
+                    for it in v:
+                        _walk_any_text(it, bag)
+                elif isinstance(v, dict):
+                    _walk_any_text(v, bag)
+            else:
+                _walk_any_text(v, bag)
+    elif isinstance(obj, list):
+        for it in obj:
+            _walk_any_text(it, bag)
+
 def _pull_from_tool_result(result_obj, citations, set_sql_fn, text_parts):
     if not isinstance(result_obj, dict): return
     j = result_obj.get("json")
@@ -190,23 +225,20 @@ def _pull_from_tool_result(result_obj, citations, set_sql_fn, text_parts):
         try: j = json.loads(j)
         except: j = None
     if not isinstance(j, dict): return
-    # 1) SQL
+    # SQL
     for k in ("sql","generated_sql","sql_query"):
         v = j.get(k)
         if isinstance(v, str) and v.strip():
             set_sql_fn(v); break
-    # 2) 검색 인용
+    # Citations
     for s in j.get("searchResults") or j.get("results") or []:
         if isinstance(s, dict):
             citations.append({
                 "source_id": s.get("source_id",""),
                 "doc_id":    s.get("doc_id","") or s.get("id","")
             })
-    # 3) 툴이 JSON으로 요약 텍스트를 줄 때도 있음
-    for k in ("text","answer","output","summary"):
-        v = j.get(k)
-        if isinstance(v, str) and v.strip():
-            text_parts.append(v)
+    # JSON 내부 텍스트도 긁기
+    _walk_any_text(j, text_parts)
 
 def parse_json_response(obj: dict):
     text_parts, citations, sql_holder = [], [], {"v": None}
@@ -217,16 +249,19 @@ def parse_json_response(obj: dict):
         if not isinstance(content, list): return
         for item in content:
             t = item.get("type")
-            if t == "text":
-                txt = item.get("text")
-                if isinstance(txt,str): text_parts.append(txt)
+            if t == "text" and isinstance(item.get("text"), str):
+                text_parts.append(item["text"])
             elif t == "tool_results":
                 for r in item.get("tool_results",{}).get("content",[]):
                     _pull_from_tool_result(r, citations, set_sql, text_parts)
-    for key in ("output","message","response","data"):
+            else:
+                _walk_any_text(item, text_parts)
+    for key in ("output","message","response","data","result"):
         node = obj.get(key)
         if isinstance(node, dict) and "content" in node:
             pull(node["content"])
+        elif node is not None:
+            _walk_any_text(node, text_parts)
     if not text_parts and "content" in obj:
         pull(obj["content"])
     return _normalize_text(" ".join(text_parts)), sql_holder["v"], citations
@@ -237,24 +272,21 @@ def parse_events_response(events: list):
         if v and isinstance(v,str) and v.strip() and not sql_holder["v"]:
             sql_holder["v"] = v
     for ev in events:
-        if not isinstance(ev, dict): continue
-        name = ev.get("event","")
         data = ev.get("data",{})
-        # 1) message.delta 형태
         delta = data.get("delta", data)
         content = (delta.get("content") if isinstance(delta, dict) else None) or []
         if isinstance(content, dict): content = [content]
-        for item in content:
-            if item.get("type") == "text":
-                t = item.get("text")
-                if isinstance(t,str): text_parts.append(t)
-            elif item.get("type") == "tool_results":
-                for r in item.get("tool_results",{}).get("content",[]):
-                    _pull_from_tool_result(r, citations, set_sql, text_parts)
-        # 2) output_text.delta 류
-        if name.startswith("output_text"):
-            t = data.get("text") or delta.get("text")
-            if isinstance(t,str): text_parts.append(t)
+        if content:
+            for item in content:
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    text_parts.append(item["text"])
+                elif item.get("type") == "tool_results":
+                    for r in item.get("tool_results",{}).get("content",[]):
+                        _pull_from_tool_result(r, citations, set_sql, text_parts)
+                else:
+                    _walk_any_text(item, text_parts)
+        else:
+            _walk_any_text(delta, text_parts)
     return _normalize_text(" ".join(text_parts)), sql_holder["v"], citations
 
 def parse_any(resp):
@@ -264,13 +296,12 @@ def parse_any(resp):
     return "", None, []
 
 # ---------------------------
-# SQL REST 실행
+# SQL via REST
 # ---------------------------
 def _sql_headers():
     return {**_headers_common(), "Accept":"application/json", "Content-Type":"application/json"}
 
 def _extract_df(payload: dict) -> pd.DataFrame:
-    # v2 통합 파서
     if "resultSet" in payload:
         rt = payload["resultSet"].get("rowType", [])
         rows = payload["resultSet"].get("rows", [])
@@ -309,7 +340,6 @@ def run_sql_rest(sql: str, timeout_s: int = 90) -> pd.DataFrame | None:
             st.error(f"Result parse error: {e}")
             st.code(json.dumps(resp)[:1500], language="json")
             return None
-    # 폴링
     get_url = f"{SQL_ENDPOINT}/{handle}"
     t0 = time.time()
     while time.time() - t0 < timeout_s:
