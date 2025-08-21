@@ -115,16 +115,14 @@ def _normalize_text(s: str) -> str:
 # Agents REST 호출 (JSON + SSE 모두 지원)
 # ---------------------------
 def build_headers():
-    # Accept에 text/event-stream 포함: SSE도 수신 가능
+    # 헤더 최소화: 비ASCII 가능성 차단 (필수만 남김)
     return {
         "Authorization": f"Bearer {PAT}",
         "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
-        "X-Snowflake-Role": ROLE,
-        "X-Snowflake-Database": DATABASE,
-        "X-Snowflake-Schema": SCHEMA,
-        "X-Snowflake-Warehouse": WAREHOUSE,
-        "Accept": "application/json, text/event-stream",
+        "Accept": "application/json",          # 우선 SSE 비활성화
         "Content-Type": "application/json",
+        # ※ 역할/DB/스키마/웨어하우스 헤더는 임시로 제거
+        # PAT의 DEFAULT_ROLE/컨텍스트로 동작하도록
     }
 
 def build_payload(user_text: str, max_results: int = 5) -> dict:
@@ -208,33 +206,25 @@ def parse_sse_text(s: str) -> list:
     return events
 
 def call_agents_rest(payload: dict, timeout: int = 60):
-    r = requests.post(API_ENDPOINT, headers=build_headers(), data=json.dumps(payload), timeout=timeout)
-    ct = r.headers.get("Content-Type", "")
-    # 에러코드면 본문 스니펫과 함께 예외
-    if r.status_code != 200:
-        snippet = (r.text or "")[:2000]
-        raise RuntimeError(f"HTTP {r.status_code} - {r.reason}\n{snippet}")
-    body = r.text or ""
-    # SSE
-    if "text/event-stream" in ct or body.startswith("event:"):
-        return parse_sse_text(body)
-    # JSON
-    if "application/json" in ct or body[:1] in ("{", "["):
-        try:
-            return r.json()
-        except Exception:
+    # 헤더 라틴-1 인코딩 검증(디버그용)
+    hdr = build_headers()
+    for k, v in list(hdr.items()):
+        if isinstance(v, str):
             try:
-                return json.loads(body)
-            except Exception:
-                pass
-    # 빈 본문 방어
-    if not body.strip():
-        raise RuntimeError(
-            "Empty 200 response from Agents API. "
-            "Check PAT (만료/권한), 헤더(ROLE/WAREHOUSE/DB/SCHEMA), Network Policy, 그리고 account_base URL."
-        )
-    # 알 수 없는 포맷 → 원문 스니펫 반환(디버그 표시용)
-    return {"raw": body[:2000], "content": []}
+                v.encode("latin-1")
+            except UnicodeEncodeError as e:
+                # 만약 여기 걸리면 바로 알려줘
+                st.error(f"Header not latin-1 encodable: {k}={v!r} ({e})")
+                raise
+
+    # 본문은 json= 으로 보내 UTF-8 처리 보장
+    r = requests.post(API_ENDPOINT, headers=hdr, json=payload, timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} - {r.reason}\n{r.text[:2000]}")
+    try:
+        return r.json()
+    except Exception:
+        return json.loads(r.text)
 
 # ---------------------------
 # 응답 파싱
