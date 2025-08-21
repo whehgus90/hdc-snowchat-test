@@ -57,30 +57,28 @@ def qualify_sql(sql: str) -> str:
 # ---------------------------
 @st.cache_resource(show_spinner=False)
 def get_conn():
+    """
+    SQL 커넥터가 실패해도 앱이 죽지 않게 안전화.
+    실패 사유는 session_state['sql_disabled_reason']에 저장.
+    """
     if not (SF_USER and SF_PASSWORD and SF_ACCOUNT):
-        return None
-    return sf.connect(
-        user=SF_USER, password=SF_PASSWORD, account=SF_ACCOUNT,
-        warehouse=WAREHOUSE, database=DATABASE, schema=SCHEMA, role=ROLE,
-        authenticator="snowflake",
-        session_parameters={"CLIENT_SESSION_KEEP_ALIVE": True},
-    )
-
-def run_sql(sql: str) -> pd.DataFrame | None:
-    conn = get_conn()
-    if conn is None:
-        st.info("🔐 secrets에 user/password/account가 없어 SQL 실행은 생략합니다.")
+        st.session_state["sql_disabled_reason"] = "missing_secrets"
         return None
     try:
-        q = qualify_sql(sql) if AUTO_QUALIFY else sql
-        with conn.cursor() as cur:
-            cur.execute(q)
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-        return pd.DataFrame(rows, columns=cols)
+        return sf.connect(
+            user=SF_USER,
+            password=SF_PASSWORD,
+            account=SF_ACCOUNT,                 # 예: qnehhfk-rub23142 (regionless) 또는 rub23142.us-west-2.aws
+            warehouse=WAREHOUSE,
+            database=DATABASE,
+            schema=SCHEMA,
+            role=ROLE,
+            authenticator="snowflake",          # 중요!
+            session_parameters={"CLIENT_SESSION_KEEP_ALIVE": True},
+        )
     except Exception as e:
-        st.error(f"❌ SQL 실행 에러: {e}")
-        st.code(sql, language="sql")
+        # 스트림릿 클라우드가 상세를 가릴 수 있으니 앞부분만 저장
+        st.session_state["sql_disabled_reason"] = str(e)[:500]
         return None
 
 # ---------------------------
@@ -407,25 +405,34 @@ if sql:
 if citations:
     ids = [c.get("doc_id","") for c in citations if c.get("doc_id")]
     if ids:
-        assistant_chunks.append("**Citations:** " + ", ".join(f"`{i}`" for i in ids))
         st.markdown("### Citations")
-    for doc_id in ids:
-        if not get_conn():  # 커넥터 없으면 전문 미리보기 생략
-            continue
-        preview_sql = f"""
-        SELECT CONVERSATION_ID, CUSTOMER_NAME, SALES_REP, DEAL_STAGE, CONVERSATION_DATE, DEAL_VALUE, PRODUCT_LINE, TRANSCRIPT_TEXT
-        FROM SALES_INTELLIGENCE.DATA.SALES_CONVERSATIONS
-        WHERE CONVERSATION_ID = '{doc_id.replace("'", "''")}'
-        """
-        dfp = run_sql(preview_sql)
-        if dfp is None or dfp.empty:
-            continue
-        row = dfp.iloc[0].to_dict()
-        header = f"[{row.get('CONVERSATION_ID','')}] {row.get('CUSTOMER_NAME','')} · {row.get('SALES_REP','')} · {row.get('DEAL_STAGE','')} · {row.get('CONVERSATION_DATE','')}"
-        body_text = row.get("TRANSCRIPT_TEXT","(no transcript)")
-        with st.expander(header):
-            st.write(body_text)
-        expanders_to_persist.append({"header": header, "body": body_text})
+        st.markdown("**IDs:** " + ", ".join(f"`{i}`" for i in ids))
+
+    # 커넥터가 준비됐을 때만 전문 미리보기
+    conn = get_conn()
+    if conn is None:
+        # 한 번만 안내 배너 표시
+        if not st.session_state.get("_sql_banner_shown"):
+            reason = st.session_state.get("sql_disabled_reason", "unknown")
+            st.info(f"🔒 SQL connector disabled: {reason}")
+            st.session_state["_sql_banner_shown"] = True
+    else:
+        # 기존 미리보기 로직 계속 사용
+        for doc_id in ids:
+            preview_sql = f"""
+            SELECT CONVERSATION_ID, CUSTOMER_NAME, SALES_REP, DEAL_STAGE,
+                   CONVERSATION_DATE, DEAL_VALUE, PRODUCT_LINE, TRANSCRIPT_TEXT
+            FROM SALES_INTELLIGENCE.DATA.SALES_CONVERSATIONS
+            WHERE CONVERSATION_ID = '{doc_id.replace("'", "''")}'
+            """
+            dfp = run_sql(preview_sql)
+            if dfp is None or dfp.empty:
+                continue
+            row = dfp.iloc[0].to_dict()
+            header = f"[{row.get('CONVERSATION_ID','')}] {row.get('CUSTOMER_NAME','')} · {row.get('SALES_REP','')} · {row.get('DEAL_STAGE','')} · {row.get('CONVERSATION_DATE','')}"
+            body_text = row.get("TRANSCRIPT_TEXT","(no transcript)")
+            with st.expander(header):
+                st.write(body_text)
 
 assistant_text = "\n\n".join(assistant_chunks).strip() if assistant_chunks else "_No answer returned._"
 assistant_msg = {"role":"assistant","content":assistant_text,"tables":tables_to_persist,"expanders":expanders_to_persist}
