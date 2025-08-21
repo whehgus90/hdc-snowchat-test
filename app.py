@@ -25,7 +25,7 @@ st.caption("Cortex Search for calls · Analyst for metrics · Persistent chat (P
 SF = st.secrets["snowflake"]
 
 ACCOUNT_BASE = SF["account_base"].rstrip("/")    # e.g. https://qnehhfk-rub23142.snowflakecomputing.com (regionless)
-SQL_BASE     = SF["sql_base"].rstrip("/")        # e.g. https://hgb46705.us-west-2.aws.snowflakecomputing.com (regional)
+SQL_BASE     = st.secrets["snowflake"]["sql_base"].rstrip("/")        # e.g. https://hgb46705.us-west-2.aws.snowflakecomputing.com (regional)
 PAT          = SF["pat"]
 
 ROLE      = SF.get("role",      "SALES_INTELLIGENCE_RL")
@@ -43,7 +43,7 @@ SEMANTIC_MODEL_FILE   = "@SALES_INTELLIGENCE.DATA.MODELS/sales_metrics_model.yam
 
 # Endpoints
 AGENT_ENDPOINT = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
-SQL_ENDPOINT   = f"{SQL_BASE}/api/statements/v2/statements"
+SQL_ENDPOINT  = f"{SQL_BASE}/api/statements/v1/statements"  # ⬅️ v1 로 바꿈
 
 # ---------------------------------------
 # Model picker (region에서 사용가능한 모델로)
@@ -282,38 +282,7 @@ def parse_any(resp):
 # ---------------------------------------
 # SQL REST (Statements v2, sync)
 # ---------------------------------------
-def run_sql_rest(sql: str, timeout_s: int = 60) -> pd.DataFrame | None:
-    try:
-        q = qualify_sql(sql) if AUTO_QUALIFY else sql
-        body = {
-            "statement": q,
-            "timeout": timeout_s,
-            "async": False,
-            "sequence_id": 0,
-            "parameters": {},
-        }
-        r = requests.post(SQL_ENDPOINT, headers=sql_headers(), params={"async": "false"}, json=body, timeout=timeout_s+15)
-        if r.status_code != 200:
-            st.error(f"SQL HTTP {r.status_code} - {r.reason}")
-            st.code(r.text[:2000] or "<empty>", language="json")
-            return None
-        data = r.json()
-        # 표준 응답: resultSetMetaData + data
-        meta = data.get("resultSetMetaData", {})
-        cols = [c.get("name","COL") for c in meta.get("rowType",[])]
-        rows = data.get("data", [])
-        # rows는 [["val1","val2",...], ...] 형태일 수 있음
-        df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
-        return df
-    except requests.exceptions.SSLError as e:
-        st.error("❌ SSL error talking to SQL endpoint. Check secrets['snowflake']['sql_base'] "
-                 "is the **locator.region.cloud** host (e.g. hgb46705.us-west-2.aws).")
-        st.code(str(e)[:1000])
-        return None
-    except Exception as e:
-        st.error(f"SQL REST error: {e}")
-        return None
-
+run_sql_rest
 # ---------------------------------------
 # Debug panel: endpoints & context
 # ---------------------------------------
