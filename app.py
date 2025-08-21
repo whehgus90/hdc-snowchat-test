@@ -81,6 +81,35 @@ def get_conn():
         st.session_state["sql_disabled_reason"] = str(e)[:500]
         return None
 
+def run_sql(sql: str) -> pd.DataFrame | None:
+    """
+    - 커넥터 없거나 실패해도 앱이 죽지 않음
+    - 테이블 이름 자동 FQN 보정
+    - 에러시 원본/보정 SQL 함께 노출
+    """
+    conn = get_conn()
+    if conn is None:
+        # 이미 get_conn에서 이유를 session_state에 저장합니다.
+        return None
+
+    try:
+        q = qualify_sql(sql) if sql else sql
+        with conn.cursor() as cur:
+            cur.execute(q)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols)
+    except Exception as e:
+        try:
+            st.error(f"❌ SQL 실행 에러: {e}")
+        finally:
+            st.markdown("**Original SQL**")
+            st.code(sql or "<empty>", language="sql")
+            if q and q != sql:
+                st.markdown("**Qualified SQL (FQN 보정)**")
+                st.code(q, language="sql")
+        return None
+        
 # ---------------------------
 # 라우팅 휴리스틱 (Search ↔ SQL)
 # ---------------------------
@@ -385,6 +414,7 @@ text, sql, citations = parse_any(body)
 assistant_chunks, tables_to_persist, expanders_to_persist = [], [], []
 
 if text:
+    text = text.replace("【†", "[").replace("†】", "]")
     assistant_chunks.append(text)
 
 if sql:
