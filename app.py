@@ -1,193 +1,219 @@
-import streamlit as st
+# app.py
 import json
-import _snowflake
-from snowflake.snowpark.context import get_active_session
+import requests
+import streamlit as st
+import pandas as pd
 
-session = get_active_session()
+# -------------------------------
+# App config
+# -------------------------------
+st.set_page_config(page_title="SNOW챗봇 (Cortex Agents)", page_icon="❄️", layout="wide")
+st.title("❄️ SNOW챗봇 - Cortex Agents (PAT + REST)")
+st.caption("Snowflake Agents + Analyst + Search (Community Cloud)")
 
-API_ENDPOINT = "/api/v2/cortex/agent:run"
-API_TIMEOUT = 50000  # in milliseconds
+# -------------------------------
+# Secrets / constants
+# -------------------------------
+SF = st.secrets["snowflake"]
+ACCOUNT_BASE = SF["account_base"]                     # e.g. https://fv93338.ap-northeast-2.aws.snowflakecomputing.com
+PAT          = SF["pat"]                              # Programmatic Access Token
+ROLE         = SF.get("role", "SALES_INTELLIGENCE_RL")
+WAREHOUSE    = SF.get("warehouse", "SALES_INTELLIGENCE_WH")
+DATABASE     = SF.get("database",  "SALES_INTELLIGENCE")
+SCHEMA       = SF.get("schema",    "DATA")
 
-CORTEX_SEARCH_SERVICES = "sales_intelligence.data.sales_conversation_search"
-SEMANTIC_MODELS = "@sales_intelligence.data.models/sales_metrics_model.yaml"
+# 모델은 서울 리전에 없을 수 있으니 Cross-Region 허용 후, 미국에서 제공되는 걸로 설정
+MODEL_NAME   = st.sidebar.selectbox("Model", ["llama3.3-70b", "mistral-large2"], index=0)
 
-def run_snowflake_query(query):
-    try:
-        df = session.sql(query.replace(';',''))
-        
-        return df
+# Quickstart에서 만든 리소스
+CORTEX_SEARCH_SERVICE = f"{DATABASE}.{SCHEMA}.SALES_CONVERSATION_SEARCH".lower()
+SEMANTIC_MODEL_FILE   = f"@{DATABASE}.{SCHEMA}.models/sales_metrics_model.yaml".lower()
 
-    except Exception as e:
-        st.error(f"Error executing SQL: {str(e)}")
-        return None, None
+API_ENDPOINT = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
 
-def snowflake_api_call(query: str, limit: int = 10):
-    
-    payload = {
-        "model": "claude-3-5-sonnet",
+# -------------------------------
+# Helpers
+# -------------------------------
+def build_headers():
+    return {
+        "Authorization": f"Bearer {PAT}",
+        "Accept": "text/event-stream",  # 서버가 SSE로 보내도록 요청
+        "Content-Type": "application/json",
+        "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+        # 컨텍스트를 헤더로 넘길 수 있음(토큰의 기본 설정이 되어 있어도 안전하게 지정)
+        "X-Snowflake-Role": ROLE,
+        "X-Snowflake-Database": DATABASE,
+        "X-Snowflake-Schema": SCHEMA,
+        "X-Snowflake-Warehouse": WAREHOUSE,
+    }
+
+def build_payload(user_text: str, max_results: int = 5):
+    return {
+        "model": MODEL_NAME,
         "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": query
-                    }
-                ]
-            }
+            {"role": "user", "content": [{"type": "text", "text": user_text}]}
         ],
         "tools": [
-            {
-                "tool_spec": {
-                    "type": "cortex_analyst_text_to_sql",
-                    "name": "analyst1"
-                }
-            },
-            {
-                "tool_spec": {
-                    "type": "cortex_search",
-                    "name": "search1"
-                }
-            }
+            {"tool_spec": {"type": "cortex_analyst_text_to_sql", "name": "analyst1"}},
+            {"tool_spec": {"type": "cortex_search", "name": "search1"}}
         ],
         "tool_resources": {
-            "analyst1": {"semantic_model_file": SEMANTIC_MODELS},
+            "analyst1": {"semantic_model_file": SEMANTIC_MODEL_FILE},
             "search1": {
-                "name": CORTEX_SEARCH_SERVICES,
-                "max_results": limit,
+                "name": CORTEX_SEARCH_SERVICE,
+                "max_results": max_results,
                 "id_column": "conversation_id"
             }
         }
     }
-    
-    try:
-        resp = _snowflake.send_snow_api_request(
-            "POST",  # method
-            API_ENDPOINT,  # path
-            {},  # headers
-            {},  # params
-            payload,  # body
-            None,  # request_guid
-            API_TIMEOUT,  # timeout in milliseconds,
-        )
-        
-        if resp["status"] != 200:
-            st.error(f"❌ HTTP Error: {resp['status']} - {resp.get('reason', 'Unknown reason')}")
-            st.error(f"Response details: {resp}")
-            return None
-        
-        try:
-            response_content = json.loads(resp["content"])
-        except json.JSONDecodeError:
-            st.error("❌ Failed to parse API response. The server may have returned an invalid JSON format.")
-            st.error(f"Raw response: {resp['content'][:200]}...")
-            return None
-            
-        return response_content
-            
-    except Exception as e:
-        st.error(f"Error making request: {str(e)}")
-        return None
 
-def process_sse_response(response):
-    """Process SSE response"""
-    text = ""
-    sql = ""
+def parse_streaming_response(resp: requests.Response):
+    """
+    SSE 스트림을 읽어 텍스트/SQL/서치결과(인용)들을 추출.
+    """
+    text_chunks = []
+    sql_text = None
     citations = []
-    
-    if not response:
-        return text, sql, citations
-    if isinstance(response, str):
-        return text, sql, citations
-    try:
-        for event in response:
-            if event.get('event') == "message.delta":
-                data = event.get('data', {})
-                delta = data.get('delta', {})
-                
-                for content_item in delta.get('content', []):
-                    content_type = content_item.get('type')
-                    if content_type == "tool_results":
-                        tool_results = content_item.get('tool_results', {})
-                        if 'content' in tool_results:
-                            for result in tool_results['content']:
-                                if result.get('type') == 'json':
-                                    text += result.get('json', {}).get('text', '')
-                                    search_results = result.get('json', {}).get('searchResults', [])
-                                    for search_result in search_results:
-                                        citations.append({'source_id':search_result.get('source_id',''), 'doc_id':search_result.get('doc_id', '')})
-                                    sql = result.get('json', {}).get('sql', '')
-                    if content_type == 'text':
-                        text += content_item.get('text', '')
-                            
-    except json.JSONDecodeError as e:
-        st.error(f"Error processing events: {str(e)}")
-                
-    except Exception as e:
-        st.error(f"Error processing events: {str(e)}")
-        
-    return text, sql, citations
 
-def main():
-    st.title("Intelligent Sales Assistant")
+    last_event = None
+    for raw in resp.iter_lines(decode_unicode=True):
+        if not raw:
+            continue
+        line = raw.strip()
+        if line.startswith("event:"):
+            last_event = line.split("event:", 1)[1].strip()
+            continue
+        if not line.startswith("data:"):
+            continue
 
-    # Sidebar for new chat
-    with st.sidebar:
-        if st.button("New Conversation", key="new_chat"):
-            st.session_state.messages = []
-            st.rerun()
+        data_str = line[5:].strip()
+        # 일부 환경에서 keepalive로 "data: [DONE]" 이 올 수 있음
+        if data_str == "[DONE]":
+            break
 
-    # Initialize session state
-    if 'messages' not in st.session_state:
+        try:
+            payload = json.loads(data_str)
+        except Exception:
+            # 혹시 배열형 이벤트(JSON array)로 올 경우 처리
+            try:
+                arr = json.loads(data_str if data_str.startswith("[") else f"[{data_str}]")
+            except Exception:
+                continue
+            for evt in arr:
+                handle_event_object(evt, text_chunks, citations, lambda s: set_sql(s))
+            continue
+
+        # 표준 SSE 경로: last_event 를 보고 처리
+        evt_obj = {"event": last_event, "data": payload}
+        handle_event_object(evt_obj, text_chunks, citations, lambda s: set_sql(s))
+
+    # 내부 클로저에서 sql_text 갱신
+    return ("".join(text_chunks).strip(), sql_text, citations)
+
+    # 내부 도우미들
+    def set_sql(s):
+        nonlocal sql_text
+        sql_text = s if s else sql_text
+
+def handle_event_object(evt_obj, text_chunks, citations, set_sql_fn):
+    """
+    message.delta 이벤트 안의 delta.content를 풀어 텍스트/툴결과를 추출
+    """
+    if not evt_obj or evt_obj.get("event") != "message.delta":
+        # error/done 등은 여기서 무시 (필요시 화면에 표시 가능)
+        return
+    data = evt_obj.get("data", {})
+    delta = data.get("delta", {})
+    for c in delta.get("content", []):
+        ctype = c.get("type")
+        if ctype == "text":
+            text_chunks.append(c.get("text", ""))
+        elif ctype == "tool_results":
+            tr = c.get("tool_results", {})
+            for item in tr.get("content", []):
+                if item.get("type") == "json":
+                    j = item.get("json", {})
+                    # Agents가 반환하는 구조: {"text": "...", "sql": "...", "searchResults":[...]}
+                    if "text" in j and isinstance(j["text"], str):
+                        text_chunks.append(j["text"])
+                    if "sql" in j and isinstance(j["sql"], str) and j["sql"]:
+                        set_sql_fn(j["sql"])
+                    if "searchResults" in j and isinstance(j["searchResults"], list):
+                        for r in j["searchResults"]:
+                            citations.append({
+                                "source_id": r.get("source_id", ""),
+                                "doc_id": r.get("doc_id", "")
+                            })
+
+# -------------------------------
+# Session state
+# -------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# -------------------------------
+# Sidebar
+# -------------------------------
+with st.sidebar:
+    st.header("Settings")
+    max_results = st.slider("Max search results", 1, 10, 5)
+    if st.button("New Conversation"):
         st.session_state.messages = []
+        st.rerun()
 
-    for message in st.session_state.messages:
-        with st.chat_message(message['role']):
-            st.markdown(message['content'].replace("•", "\n\n"))
+# -------------------------------
+# Chat history
+# -------------------------------
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-    if query := st.chat_input("Would you like to learn?"):
-        # Add user message to chat
-        with st.chat_message("user"):
-            st.markdown(query)
-        st.session_state.messages.append({"role": "user", "content": query})
-        
-        # Get response from API
-        with st.spinner("Processing your request..."):
-            response = snowflake_api_call(query, 1)
-            text, sql, citations = process_sse_response(response)
-            
-            # Add assistant response to chat
+# -------------------------------
+# Input & Call
+# -------------------------------
+query = st.chat_input("질문을 입력하세요 (예: How many deals did Sarah Johnson win compared to lost?)")
+if query:
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(query)
+
+    with st.spinner("Calling Snowflake Agents..."):
+        payload = build_payload(query, max_results=max_results)
+        resp = requests.post(API_ENDPOINT, headers=build_headers(), data=json.dumps(payload), stream=True)
+
+        if resp.status_code != 200:
+            st.error(f"HTTP {resp.status_code} — {resp.reason}")
+            # 서버가 JSON 에러를 줄 수 있으니 본문 일부 표시
+            try:
+                st.code(resp.text[:2000], language="json")
+            except Exception:
+                st.text(resp.text[:2000])
+        else:
+            text, sql, cites = parse_streaming_response(resp)
+
+            # 답 텍스트
             if text:
-                text = text.replace("【†", "[")
-                text = text.replace("†】", "]")
+                # 특수 괄호 교정(인라인 인용 표기 등)
+                text = text.replace("【†", "[").replace("†】", "]")
                 st.session_state.messages.append({"role": "assistant", "content": text})
-                
                 with st.chat_message("assistant"):
-                    st.markdown(text.replace("•", "\n\n"))
-                    if citations:
-                        st.write("Citations:")
-                        for citation in citations:
-                            doc_id = citation.get("doc_id", "")
-                            if doc_id:
-                                query = f"SELECT transcript_text FROM sales_conversations WHERE conversation_id = '{doc_id}'"
-                                result = run_snowflake_query(query)
-                                result_df = result.to_pandas()
-                                if not result_df.empty:
-                                    transcript_text = result_df.iloc[0, 0]
-                                else:
-                                    transcript_text = "No transcript available"
-                    
-                                with st.expander(f"[{citation.get('source_id', '')}]"):
-                                    st.write(transcript_text)
+                    st.markdown(text)
+            else:
+                st.warning("응답 텍스트가 비었습니다.")
 
-            # Display SQL if present
+            # 생성된 SQL이 있으면 표시 (분석 결과)
             if sql:
                 st.markdown("### Generated SQL")
                 st.code(sql, language="sql")
-                sales_results = run_snowflake_query(sql)
-                if sales_results:
-                    st.write("### Sales Metrics Report")
-                    st.dataframe(sales_results)
 
-if __name__ == "__main__":
-    main()
+            # 검색 인용 결과가 있으면 표시 (문서/대화 출처)
+            if cites:
+                st.markdown("### Citations")
+                cite_df = pd.DataFrame(cites)
+                st.dataframe(cite_df)
+
+# -------------------------------
+# Footer
+# -------------------------------
+st.markdown("---")
+st.caption("© 2025 HDC DataLab · Streamlit + Snowflake Cortex Agents (PAT)")
