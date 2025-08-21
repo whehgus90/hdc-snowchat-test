@@ -115,14 +115,16 @@ def _normalize_text(s: str) -> str:
 # Agents REST 호출 (JSON + SSE 모두 지원)
 # ---------------------------
 def build_headers():
-    # 헤더 최소화: 비ASCII 가능성 차단 (필수만 남김)
+    # PAT + 컨텍스트 헤더 (ASCII만 사용)
     return {
         "Authorization": f"Bearer {PAT}",
         "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
-        "Accept": "application/json",          # 우선 SSE 비활성화
+        "X-Snowflake-Role": ROLE,
+        "X-Snowflake-Database": DATABASE,
+        "X-Snowflake-Schema": SCHEMA,
+        "X-Snowflake-Warehouse": WAREHOUSE,
+        "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
-        # ※ 역할/DB/스키마/웨어하우스 헤더는 임시로 제거
-        # PAT의 DEFAULT_ROLE/컨텍스트로 동작하도록
     }
 
 def build_payload(user_text: str, max_results: int = 5) -> dict:
@@ -206,25 +208,62 @@ def parse_sse_text(s: str) -> list:
     return events
 
 def call_agents_rest(payload: dict, timeout: int = 60):
-    # 헤더 라틴-1 인코딩 검증(디버그용)
-    hdr = build_headers()
-    for k, v in list(hdr.items()):
-        if isinstance(v, str):
-            try:
-                v.encode("latin-1")
-            except UnicodeEncodeError as e:
-                # 만약 여기 걸리면 바로 알려줘
-                st.error(f"Header not latin-1 encodable: {k}={v!r} ({e})")
-                raise
+    # 안전 요청 + 응답 형태 감지(JSON / SSE) + 디버그 출력
+    r = requests.post(API_ENDPOINT, headers=build_headers(), json=payload, timeout=timeout)
+    ctype = r.headers.get("Content-Type", "")
+    st.write(f"DEBUG: HTTP {r.status_code}, Content-Type={ctype}")
 
-    # 본문은 json= 으로 보내 UTF-8 처리 보장
-    r = requests.post(API_ENDPOINT, headers=hdr, json=payload, timeout=timeout)
     if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code} - {r.reason}\n{r.text[:2000]}")
-    try:
-        return r.json()
-    except Exception:
-        return json.loads(r.text)
+        # 에러 바디를 그대로 보여줘서 원인 파악
+        st.error(f"HTTP {r.status_code} - {r.reason}")
+        st.code(r.text[:2000] or "<empty>", language="json")
+        return None
+
+    body_text = r.text or ""
+    # 1) JSON 응답
+    if "application/json" in ctype:
+        try:
+            return r.json()
+        except Exception:
+            st.error("JSON 파싱 실패 → Raw 바디 앞부분 표시")
+            st.code(body_text[:2000] or "<empty>", language="json")
+            return None
+
+    # 2) SSE 응답
+    if "text/event-stream" in ctype or body_text.startswith("event:") or "\ndata:" in body_text:
+        events = []
+        cur_event = None
+        data_lines = []
+        lines = body_text.splitlines()
+        for line in lines + [""]:  # 마지막 flush용 공백라인 추가
+            if line.startswith("event:"):
+                # 이전 이벤트 flush
+                if cur_event is not None:
+                    data_str = "\n".join(data_lines).strip()
+                    try:
+                        data_json = json.loads(data_str) if data_str else {}
+                    except Exception:
+                        data_json = {"raw": data_str}
+                    events.append({"event": cur_event, "data": data_json})
+                cur_event = line.split("event:", 1)[1].strip()
+                data_lines = []
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+            elif line.strip() == "":
+                if cur_event is not None:
+                    data_str = "\n".join(data_lines).strip()
+                    try:
+                        data_json = json.loads(data_str) if data_str else {}
+                    except Exception:
+                        data_json = {"raw": data_str}
+                    events.append({"event": cur_event, "data": data_json})
+                    cur_event, data_lines = None, []
+        return events
+
+    # 3) 알 수 없는 컨텐츠 → 원문 표시
+    st.error("알 수 없는 응답 형식 → Raw 바디 앞부분 표시")
+    st.code(body_text[:2000] or "<empty>")
+    return None
 
 # ---------------------------
 # 응답 파싱
