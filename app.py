@@ -1,5 +1,4 @@
-# app.py — Streamlit Cloud Ready (PAT + REST, JSON 강제, v1 Statements, 영구 히스토리)
-# 필요 패키지: streamlit, requests, pandas
+# app.py — Streamlit Cloud (PAT + REST, SSE/JSON 자동, v1 Statements, 영구 히스토리)
 
 import json, re, requests, pandas as pd, streamlit as st
 
@@ -8,21 +7,21 @@ import json, re, requests, pandas as pd, streamlit as st
 # ---------------------------
 st.set_page_config(page_title="❄️ SNOW챗봇 (Cortex Agents)", page_icon="❄️", layout="wide")
 st.title("❄️ SNOW챗봇 - Cortex Agents (Cloud)")
-st.caption("Cortex Search for calls · Analyst for metrics · Persistent chat (JSON only)")
+st.caption("Cortex Search for calls · Analyst for metrics · Persistent chat")
 
 # ---------------------------
-# Secrets (Streamlit Cloud의 secrets.toml)
+# Secrets (Streamlit Cloud)
 # ---------------------------
 SF = st.secrets["snowflake"]
-ACCOUNT_BASE = SF["account_base"].rstrip("/")  # Agents(regionless): https://qnehhfk-<acct>.snowflakecomputing.com
-SQL_BASE     = SF["sql_base"].rstrip("/")      # SQL(regional):    https://<account_locator>.snowflakecomputing.com
-PAT          = SF["pat"]                       # Programmatic Access Token
+ACCOUNT_BASE = SF["account_base"].rstrip("/")    # ex) https://qnehhfk-rub23142.snowflakecomputing.com  (regionless)
+SQL_BASE     = SF["sql_base"].rstrip("/")        # ex) https://hgb46705.snowflakecomputing.com          (regional)
+PAT          = SF["pat"]
 ROLE         = SF.get("role", "SALES_INTELLIGENCE_RL")
 WAREHOUSE    = SF.get("warehouse", "SALES_INTELLIGENCE_WH")
 DATABASE     = SF.get("database",  "SALES_INTELLIGENCE")
 SCHEMA       = SF.get("schema",    "DATA")
 
-# 모델 선택(리전에 맞게)
+# 모델 선택(리전에 맞는 것만)
 MODEL_NAME = st.sidebar.selectbox("Model", ["mistral-large2", "llama3.3-70b"], index=0)
 
 # 항상 적용
@@ -34,7 +33,7 @@ CORTEX_SEARCH_SERVICE = "SALES_INTELLIGENCE.DATA.SALES_CONVERSATION_SEARCH"
 SEMANTIC_MODEL_FILE   = "@SALES_INTELLIGENCE.DATA.MODELS/sales_metrics_model.yaml"
 
 AGENT_ENDPOINT = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
-SQL_ENDPOINT   = f"{SQL_BASE}/api/statements/v1/statements"  # ✅ v1 고정
+SQL_ENDPOINT   = f"{SQL_BASE}/api/statements/v1/statements"
 
 st.caption(f"AGENT_ENDPOINT = {AGENT_ENDPOINT}")
 st.caption(f"SQL_ENDPOINT   = {SQL_ENDPOINT}")
@@ -53,7 +52,7 @@ def qualify_sql(sql: str) -> str:
     return s
 
 # ---------------------------
-# 먼저 정의: SQL REST 실행(v1 Statements)
+# Statements v1 실행
 # ---------------------------
 def _sql_headers():
     return {
@@ -67,24 +66,27 @@ def _sql_headers():
         "Content-Type": "application/json",
     }
 
-def run_sql_rest(sql: str, timeout_s: int = 60) -> pd.DataFrame | None:
+def run_sql_rest(sql: str, timeout_s: int = 90) -> pd.DataFrame | None:
     q = qualify_sql(sql).strip().rstrip(";")
     body = {
         "statement": q,
         "timeout":   timeout_s * 1000,  # ms
         "resultFormat": "json",
-        "parameters": {"MULTI_STATEMENT_COUNT": 1}
+        "parameters": {"MULTI_STATEMENT_COUNT": 1},
     }
-    params = {"async": "false"}
     try:
-        r = requests.post(SQL_ENDPOINT, headers=_sql_headers(), params=params, json=body, timeout=timeout_s + 15)
+        r = requests.post(
+            f"{SQL_ENDPOINT}?async=false",
+            headers=_sql_headers(),
+            json=body,
+            timeout=timeout_s + 15,
+        )
         if r.status_code != 200:
             st.error(f"SQL HTTP {r.status_code} - {r.reason}")
             st.code(r.text[:2000] or "<empty>", language="json")
             return None
-        data = r.json()
 
-        # v1 JSON 결과 파서(유연)
+        data = r.json()
         res  = data.get("result", {})
         meta = res.get("resultSetMetaData", {})
         row_type = meta.get("rowType", [])
@@ -102,16 +104,14 @@ def run_sql_rest(sql: str, timeout_s: int = 60) -> pd.DataFrame | None:
             # 형태 B: 그냥 값 배열
             elif isinstance(rows[0], list):
                 values = rows
-            # 형태 C: object list
+            # 형태 C: 객체 배열
             elif isinstance(rows[0], dict):
-                df = pd.DataFrame(rows)
-                return df
+                return pd.DataFrame(rows)
 
-        df = pd.DataFrame(values, columns=cols if cols else None)
-        return df
+        return pd.DataFrame(values, columns=cols if cols else None)
 
     except requests.exceptions.SSLError as e:
-        st.error("❌ SSL error talking to SQL endpoint. secrets['snowflake']['sql_base'] 가 '계정로케이터.snowflakecomputing.com' 형식인지 확인.")
+        st.error("❌ SQL SSL error — secrets['snowflake']['sql_base'] 값이 '계정로케이터.snowflakecomputing.com' 형식인지 확인.")
         st.code(str(e), language="text")
         return None
     except Exception as e:
@@ -119,66 +119,140 @@ def run_sql_rest(sql: str, timeout_s: int = 60) -> pd.DataFrame | None:
         return None
 
 # ---------------------------
-# 텍스트 정리 + JSON 파서
+# 텍스트 정리 + 응답 파서
 # ---------------------------
 def _normalize_text(s: str) -> str:
     s = s.replace("\r\n", "\n")
-    s = s.replace("【†", "[").replace("†】", "]")  # 특수각괄호 수습
+    s = s.replace("【†", "[").replace("†】", "]")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 def _pull_from_tool_result(result_obj, citations, set_sql_fn):
-    if not isinstance(result_obj, dict): return
+    if not isinstance(result_obj, dict):
+        return
     j = result_obj.get("json")
     if isinstance(j, str):
-        try: j = json.loads(j)
-        except: j = None
-    if not isinstance(j, dict): return
-    for k in ("sql","generated_sql","sql_query"):
+        try:
+            j = json.loads(j)
+        except Exception:
+            j = None
+    if not isinstance(j, dict):
+        return
+    for k in ("sql", "generated_sql", "sql_query"):
         v = j.get(k)
         if isinstance(v, str) and v.strip():
-            set_sql_fn(v); break
-    sr = j.get("searchResults") or j.get("results") or []
-    if isinstance(sr, list):
-        for s in sr:
-            if isinstance(s, dict):
-                citations.append({"source_id": s.get("source_id",""),
-                                  "doc_id":    s.get("doc_id","") or s.get("id","")})
+            set_sql_fn(v)
+            break
+    for s in j.get("searchResults") or j.get("results") or []:
+        if isinstance(s, dict):
+            citations.append({
+                "source_id": s.get("source_id", ""),
+                "doc_id":    s.get("doc_id", "") or s.get("id", "")
+            })
 
 def parse_json_response(obj: dict):
     text_parts, citations = [], []
     sql_holder = {"v": None}
     def set_sql(v):
-        if v and isinstance(v,str) and v.strip(): sql_holder["v"] = v
+        if v and isinstance(v, str) and v.strip():
+            sql_holder["v"] = v
     def pull(content):
-        if isinstance(content, dict): content = [content]
-        if not isinstance(content, list): return
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            return
         for item in content:
             t = item.get("type")
             if t == "text":
                 txt = item.get("text")
-                if isinstance(txt,str): text_parts.append(txt)
+                if isinstance(txt, str):
+                    text_parts.append(txt)
             elif t == "tool_results":
-                for r in item.get("tool_results",{}).get("content",[]):
+                for r in item.get("tool_results", {}).get("content", []):
                     _pull_from_tool_result(r, citations, set_sql)
-    for key in ("output","message","response","data"):
+    for key in ("output", "message", "response", "data"):
         node = obj.get(key)
         if isinstance(node, dict) and "content" in node:
             pull(node["content"])
     if not text_parts and "content" in obj:
         pull(obj["content"])
-    text = _normalize_text("".join(text_parts))
-    return text, sql_holder["v"], citations
+    return _normalize_text("".join(text_parts)), sql_holder["v"], citations
 
-def parse_any(resp):
-    if resp is None: return "", None, []
-    if isinstance(resp, dict):  return parse_json_response(resp)
-    # (JSON 강제라 list/SSE는 기대하지 않음 — 예외적으로 오면 빈 처리)
+# --- SSE 텍스트를 events로 파싱
+def parse_sse_text(s: str) -> list:
+    events = []
+    cur_event, data_lines = None, []
+    for line in (s or "").splitlines() + [""]:  # 마지막 flush
+        if line.startswith("event:"):
+            if cur_event is not None:
+                data_str = "\n".join(data_lines).strip()
+                try:
+                    data_json = json.loads(data_str) if data_str else {}
+                except Exception:
+                    data_json = {"raw": data_str}
+                events.append({"event": cur_event, "data": data_json})
+            cur_event = line.split("event:", 1)[1].strip()
+            data_lines = []
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+        elif line.strip() == "" and cur_event is not None:
+            data_str = "\n".join(data_lines).strip()
+            try:
+                data_json = json.loads(data_str) if data_str else {}
+            except Exception:
+                data_json = {"raw": data_str}
+            events.append({"event": cur_event, "data": data_json})
+            cur_event, data_lines = None, []
+    return events
+
+def parse_events_response(events: list):
+    text_parts, citations = [], []
+    sql_holder = {"v": None}
+    def set_sql(v):
+        if v and isinstance(v, str) and v.strip() and not sql_holder["v"]:
+            sql_holder["v"] = v
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("event") != "message.delta":
+            # 최종 메시지가 message.completed로 올 수도 있으나, 대부분 delta 누적으로 충분
+            continue
+        payload = ev.get("data", {})
+        delta = payload.get("delta", payload)  # 일부 구현은 data 바로 아래에 존재
+        content = delta.get("content") or []
+        if isinstance(content, dict):
+            content = [content]
+        for item in content:
+            t = item.get("type")
+            # {'type':'text','text':...}
+            if t == "text":
+                txt = item.get("text")
+                if isinstance(txt, str):
+                    text_parts.append(txt)
+            # {'type':'tool_results', ...}
+            elif t == "tool_results":
+                for r in item.get("tool_results", {}).get("content", []):
+                    _pull_from_tool_result(r, citations, set_sql)
+            # tool_use는 무시(뒤이어 tool_results가 옴)
+    return _normalize_text("".join(text_parts)), sql_holder["v"], citations
+
+def parse_any(resp, content_type=""):
+    if resp is None:
+        return "", None, []
+    # JSON(dict)
+    if isinstance(resp, dict):
+        return parse_json_response(resp)
+    # events(list)
+    if isinstance(resp, list):
+        return parse_events_response(resp)
+    # raw SSE 텍스트
+    if isinstance(resp, str) and ("text/event-stream" in content_type or resp.startswith("event:")):
+        return parse_events_response(parse_sse_text(resp))
     return "", None, []
 
 # ---------------------------
-# 라우팅 휴리스틱 (Search ↔ SQL)
+# Intent 라우팅
 # ---------------------------
 _SEARCH_HINTS = {
     "call","calls","conversation","conversations","transcript","transcripts",
@@ -197,7 +271,7 @@ def detect_intent(q: str) -> str:
     return "Auto"
 
 # ---------------------------
-# Agents REST 호출 (JSON 강제: stream=False + Accept: application/json)
+# Agents 호출 (SSE/JSON 자동)
 # ---------------------------
 def agent_headers():
     return {
@@ -207,7 +281,7 @@ def agent_headers():
         "X-Snowflake-Database": DATABASE,
         "X-Snowflake-Schema": SCHEMA,
         "X-Snowflake-Warehouse": WAREHOUSE,
-        "Accept": "application/json",          # ✅ JSON만 받기
+        "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
     }
 
@@ -247,7 +321,7 @@ def build_payload(user_text: str, max_results: int = 5) -> dict:
         ],
         "tools": tools,
         "tool_resources": tool_resources,
-        "stream": False,                     # ✅ 스트리밍 끔 → JSON 보장
+        # 'stream' 지정 안 함 → 서버 기본(SSE/JSON) 그대로 수용
     }
 
 def call_agents(payload: dict, timeout=90):
@@ -257,21 +331,23 @@ def call_agents(payload: dict, timeout=90):
     if r.status_code != 200:
         st.error(f"HTTP {r.status_code} - {r.reason}")
         st.code(r.text[:2000] or "<empty>", language="json")
-        return None
-    try:
-        return r.json()
-    except Exception:
-        st.error("JSON 파싱 실패 → Raw 바디 앞부분 표시")
-        st.code(r.text[:2000] or "<empty>", language="json")
-        return None
+        return None, ctype
+    if "application/json" in ctype:
+        try:
+            return r.json(), ctype
+        except Exception:
+            # JSON 실패 시 Raw
+            return r.text, ctype
+    # SSE or 기타
+    return r.text, ctype
 
 # ---------------------------
-# Chat state (히스토리 보존: 표/인용 전문까지 저장)
+# Chat state (히스토리 보존)
 # ---------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# 히스토리 렌더링 (DB 재조회 없이 저장된 컨텐츠만 표시)
+# 히스토리 렌더링
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m.get("content",""))
@@ -296,19 +372,19 @@ with st.chat_message("user"):
 
 # 에이전트 호출
 with st.spinner("Calling Cortex Agents..."):
-    resp = call_agents(build_payload(query, max_results=5))
+    raw, ctype = call_agents(build_payload(query, max_results=5))
 
-text, sql, citations = parse_any(resp)
+# 파싱(JSON/SSE 자동)
+text, sql, citations = parse_any(raw, content_type=ctype)
 
 # ---------------------------
-# 폴백(에이전트가 텍스트/SQL을 안 줄 때)
+# 폴백(SQL 질문인데 결과 비었을 때)
 # ---------------------------
 def _extract_rep_name(q: str) -> str | None:
     m = re.search(r"\b([A-Z][a-z]+ [A-Z][a-z]+)\b", q or "")
     return m.group(1) if m else None
 
 def _fallback_wonlost(q: str) -> tuple[str, pd.DataFrame | None]:
-    """질문이 'won/lost' 류면 직접 SQL 실행."""
     rep = _extract_rep_name(q) or "Sarah Johnson"
     sql_fb = f"""
     SELECT
@@ -321,28 +397,27 @@ def _fallback_wonlost(q: str) -> tuple[str, pd.DataFrame | None]:
     GROUP BY win_status
     ORDER BY win_status DESC NULLS LAST
     """
-    return rep, run_sql_rest(sql_fb, timeout_s=60)
+    return rep, run_sql_rest(sql_fb, timeout_s=90)
 
 intent = detect_intent(query)
 if not text and not sql and intent in ("SQL","Auto") and ("won" in query.lower() or "lost" in query.lower()):
     rep, df_fb = _fallback_wonlost(query)
     if df_fb is not None and not df_fb.empty:
-        sql = f"-- fallback\n{qualify_sql('select ... (see above)')}"
         text = f"(fallback) **{rep}** → won/lost breakdown from SALES_METRICS."
+        sql  = "/* fallback query executed */ " + "SELECT ..."
 
 # ---------------------------
-# 어시스턴트 메시지 구성 + 첨부를 함께 저장
+# 어시스턴트 메시지 구성 + 첨부 저장
 # ---------------------------
 assistant_chunks, tables_to_persist, expanders_to_persist = [], [], []
 
 if text:
     assistant_chunks.append(text)
 
-# 생성된 SQL 있으면 실행 → 결과 표 저장
 if sql:
     assistant_chunks.append("### Generated SQL\n```sql\n" + sql.strip() + "\n```")
     if AUTO_RUN_SQL:
-        df = run_sql_rest(sql, timeout_s=90)
+        df = run_sql_rest(sql, timeout_s=120)
         if df is not None:
             st.write("### Query Result")
             st.dataframe(df, use_container_width=True)
@@ -351,7 +426,7 @@ if sql:
                 "title": "Query Result",
                 "data": df_safe.to_dict(orient="records")
             })
-            # win/lost 요약 자동화
+            # win/lost 요약 자동
             cols_lower = [c.lower() for c in df.columns]
             if "win_status" in cols_lower and ("deal_count" in cols_lower or "count" in cols_lower):
                 win_col = df.columns[cols_lower.index("win_status")]
@@ -363,7 +438,7 @@ if sql:
                 except Exception:
                     pass
 
-# Citations → 전문 미리보기도 즉시 조회하고 저장(차후 리렌더링 시 재조회 없음)
+# Citations → 전문 미리보기 즉시 조회(REST) + 히스토리에 저장
 if citations:
     ids = [c.get("doc_id","") for c in citations if c.get("doc_id")]
     if ids:
