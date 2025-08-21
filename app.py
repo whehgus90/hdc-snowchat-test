@@ -1,106 +1,193 @@
 import streamlit as st
-import snowflake.connector
+import json
+import _snowflake
+from snowflake.snowpark.context import get_active_session
 
-st.set_page_config(page_title="SNOW챗봇", page_icon="❄️", layout="wide")
-st.title("❄️ SNOW챗봇")
-st.markdown("---")
+session = get_active_session()
 
-# -------------------------------
-# Snowflake 연결 (Secrets 사용)
-# -------------------------------
-@st.cache_resource
-def init_connection():
-    return snowflake.connector.connect(
-        user=st.secrets["snowflake"]["user"],
-        password=st.secrets["snowflake"]["password"],
-        account=st.secrets["snowflake"]["account"],   # 예: fv93338.ap-northeast-2.aws
-        warehouse=st.secrets["snowflake"]["warehouse"],
-        database=st.secrets["snowflake"]["database"],
-        schema=st.secrets["snowflake"]["schema"],
-        role=st.secrets["snowflake"]["role"],
-        authenticator="snowflake",
-        session_parameters={"CLIENT_SESSION_KEEP_ALIVE": True},
-    )
+API_ENDPOINT = "/api/v2/cortex/agent:run"
+API_TIMEOUT = 50000  # in milliseconds
 
-conn = init_connection()
+CORTEX_SEARCH_SERVICES = "sales_intelligence.data.sales_conversation_search"
+SEMANTIC_MODELS = "@sales_intelligence.data.models/sales_metrics_model.yaml"
 
-def run_query(query: str):
-    with conn.cursor() as cur:
-        cur.execute(query)
-        return cur.fetchall()
+def run_snowflake_query(query):
+    try:
+        df = session.sql(query.replace(';',''))
+        
+        return df
 
-# -------------------------------
-# 사이드바
-# -------------------------------
-with st.sidebar:
-    st.header("설정")
-    lang = st.selectbox("언어 선택", ["한국어", "English"])
-    st.slider("응답 길이", 1, 10, 5)
+    except Exception as e:
+        st.error(f"Error executing SQL: {str(e)}")
+        return None, None
 
-# -------------------------------
-# 채팅 영역
-# -------------------------------
-st.header("💬 채팅")
+def snowflake_api_call(query: str, limit: int = 10):
+    
+    payload = {
+        "model": "claude-3-5-sonnet",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": query
+                    }
+                ]
+            }
+        ],
+        "tools": [
+            {
+                "tool_spec": {
+                    "type": "cortex_analyst_text_to_sql",
+                    "name": "analyst1"
+                }
+            },
+            {
+                "tool_spec": {
+                    "type": "cortex_search",
+                    "name": "search1"
+                }
+            }
+        ],
+        "tool_resources": {
+            "analyst1": {"semantic_model_file": SEMANTIC_MODELS},
+            "search1": {
+                "name": CORTEX_SEARCH_SERVICES,
+                "max_results": limit,
+                "id_column": "conversation_id"
+            }
+        }
+    }
+    
+    try:
+        resp = _snowflake.send_snow_api_request(
+            "POST",  # method
+            API_ENDPOINT,  # path
+            {},  # headers
+            {},  # params
+            payload,  # body
+            None,  # request_guid
+            API_TIMEOUT,  # timeout in milliseconds,
+        )
+        
+        if resp["status"] != 200:
+            st.error(f"❌ HTTP Error: {resp['status']} - {resp.get('reason', 'Unknown reason')}")
+            st.error(f"Response details: {resp}")
+            return None
+        
+        try:
+            response_content = json.loads(resp["content"])
+        except json.JSONDecodeError:
+            st.error("❌ Failed to parse API response. The server may have returned an invalid JSON format.")
+            st.error(f"Raw response: {resp['content'][:200]}...")
+            return None
+            
+        return response_content
+            
+    except Exception as e:
+        st.error(f"Error making request: {str(e)}")
+        return None
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+def process_sse_response(response):
+    """Process SSE response"""
+    text = ""
+    sql = ""
+    citations = []
+    
+    if not response:
+        return text, sql, citations
+    if isinstance(response, str):
+        return text, sql, citations
+    try:
+        for event in response:
+            if event.get('event') == "message.delta":
+                data = event.get('data', {})
+                delta = data.get('delta', {})
+                
+                for content_item in delta.get('content', []):
+                    content_type = content_item.get('type')
+                    if content_type == "tool_results":
+                        tool_results = content_item.get('tool_results', {})
+                        if 'content' in tool_results:
+                            for result in tool_results['content']:
+                                if result.get('type') == 'json':
+                                    text += result.get('json', {}).get('text', '')
+                                    search_results = result.get('json', {}).get('searchResults', [])
+                                    for search_result in search_results:
+                                        citations.append({'source_id':search_result.get('source_id',''), 'doc_id':search_result.get('doc_id', '')})
+                                    sql = result.get('json', {}).get('sql', '')
+                    if content_type == 'text':
+                        text += content_item.get('text', '')
+                            
+    except json.JSONDecodeError as e:
+        st.error(f"Error processing events: {str(e)}")
+                
+    except Exception as e:
+        st.error(f"Error processing events: {str(e)}")
+        
+    return text, sql, citations
 
-# 과거 메시지
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+def main():
+    st.title("Intelligent Sales Assistant")
 
-# 입력창
-if prompt := st.chat_input("메시지를 입력하세요..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    # Sidebar for new chat
+    with st.sidebar:
+        if st.button("New Conversation", key="new_chat"):
+            st.session_state.messages = []
+            st.rerun()
 
-    # 간단 라우팅: Sarah Johnson 승/패/보류
-    if "Sarah Johnson" in prompt:
-        sql = """
-        SELECT
-          SUM(CASE WHEN win_status = TRUE  THEN 1 ELSE 0 END) AS WON_DEALS,
-          SUM(CASE WHEN sales_stage = 'Lost' THEN 1 ELSE 0 END) AS LOST_DEALS,
-          SUM(CASE WHEN win_status = FALSE AND sales_stage <> 'Lost' THEN 1 ELSE 0 END) AS PENDING_OR_OPEN
-        FROM SALES_INTELLIGENCE.DATA.SALES_METRICS
-        WHERE sales_rep = 'Sarah Johnson';
-        """
-        rows = run_query(sql)
-        if rows and len(rows[0]) == 3:
-            won, lost, pending = rows[0]
-            bot_response = (
-                "📊 결과:\n"
-                f"- Won(승): {won}\n"
-                f"- Lost(패): {lost}\n"
-                f"- Pending/Open: {pending}\n"
-            )
-        else:
-            bot_response = "결과가 없습니다. 데이터/권한을 확인해주세요."
-    else:
-        bot_response = f"'{prompt}'에 대한 Snowflake 쿼리를 아직 정의하지 않았어요."
-
-    st.session_state.messages.append({"role":"assistant","content":bot_response})
-    with st.chat_message("assistant"):
-        st.markdown(bot_response)
-
-# 하단 유틸
-st.markdown("---")
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.info("📊 통계")
-    st.metric("총 메시지", len(st.session_state.messages))
-    st.metric("사용자 메시지", len([m for m in st.session_state.messages if m["role"] == "user"]))
-with col2:
-    st.success("🔧 도구")
-    if st.button("채팅 초기화"):
+    # Initialize session state
+    if 'messages' not in st.session_state:
         st.session_state.messages = []
-        st.rerun()
-    if st.button("샘플 질문"):
-        st.write("💡 예시:")
-        st.write("- How many deals did Sarah Johnson win compared to deals she lost?")
-with col3:
-    st.warning("ℹ️ 정보")
-    st.write("**SNOW챗봇 (Community Cloud)**")
-    st.write("Streamlit + Snowflake")
-st.caption("© 2024 HDC DataLab - SNOW챗봇")
+
+    for message in st.session_state.messages:
+        with st.chat_message(message['role']):
+            st.markdown(message['content'].replace("•", "\n\n"))
+
+    if query := st.chat_input("Would you like to learn?"):
+        # Add user message to chat
+        with st.chat_message("user"):
+            st.markdown(query)
+        st.session_state.messages.append({"role": "user", "content": query})
+        
+        # Get response from API
+        with st.spinner("Processing your request..."):
+            response = snowflake_api_call(query, 1)
+            text, sql, citations = process_sse_response(response)
+            
+            # Add assistant response to chat
+            if text:
+                text = text.replace("【†", "[")
+                text = text.replace("†】", "]")
+                st.session_state.messages.append({"role": "assistant", "content": text})
+                
+                with st.chat_message("assistant"):
+                    st.markdown(text.replace("•", "\n\n"))
+                    if citations:
+                        st.write("Citations:")
+                        for citation in citations:
+                            doc_id = citation.get("doc_id", "")
+                            if doc_id:
+                                query = f"SELECT transcript_text FROM sales_conversations WHERE conversation_id = '{doc_id}'"
+                                result = run_snowflake_query(query)
+                                result_df = result.to_pandas()
+                                if not result_df.empty:
+                                    transcript_text = result_df.iloc[0, 0]
+                                else:
+                                    transcript_text = "No transcript available"
+                    
+                                with st.expander(f"[{citation.get('source_id', '')}]"):
+                                    st.write(transcript_text)
+
+            # Display SQL if present
+            if sql:
+                st.markdown("### Generated SQL")
+                st.code(sql, language="sql")
+                sales_results = run_snowflake_query(sql)
+                if sales_results:
+                    st.write("### Sales Metrics Report")
+                    st.dataframe(sales_results)
+
+if __name__ == "__main__":
+    main()
