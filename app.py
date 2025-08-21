@@ -33,7 +33,7 @@ CORTEX_SEARCH_SERVICE = "SALES_INTELLIGENCE.DATA.SALES_CONVERSATION_SEARCH"
 SEMANTIC_MODEL_FILE   = "@SALES_INTELLIGENCE.DATA.MODELS/sales_metrics_model.yaml"
 
 AGENT_ENDPOINT = f"{ACCOUNT_BASE}/api/v2/cortex/agent:run"
-SQL_ENDPOINT   = f"{SQL_BASE}/api/statements/v1/statements"
+SQL_ENDPOINT   = f"{SQL_BASE}/api/statements/v2/statements"
 
 st.caption(f"AGENT_ENDPOINT = {AGENT_ENDPOINT}")
 st.caption(f"SQL_ENDPOINT   = {SQL_ENDPOINT}")
@@ -75,12 +75,13 @@ def run_sql_rest(sql: str, timeout_s: int = 90) -> pd.DataFrame | None:
         "parameters": {"MULTI_STATEMENT_COUNT": 1},
     }
     try:
-        r = requests.post(
-            f"{SQL_ENDPOINT}?async=false",
-            headers=_sql_headers(),
-            json=body,
-            timeout=timeout_s + 15,
-        )
+       r = requests.post(
+    SQL_ENDPOINT,
+    headers=_sql_headers(),
+    params={"async": "false"},
+    json=body,
+    timeout=timeout_s + 15,
+)
         if r.status_code != 200:
             st.error(f"SQL HTTP {r.status_code} - {r.reason}")
             st.code(r.text[:2000] or "<empty>", language="json")
