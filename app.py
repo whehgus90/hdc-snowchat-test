@@ -1,4 +1,4 @@
-# app.py — Streamlit Cloud Ready (PAT + REST, SSE 파서, 영구 히스토리, v1 Statements)
+# app.py — Streamlit Cloud Ready (PAT + REST, JSON 강제, v1 Statements, 영구 히스토리)
 # 필요 패키지: streamlit, requests, pandas
 
 import json, re, requests, pandas as pd, streamlit as st
@@ -8,14 +8,14 @@ import json, re, requests, pandas as pd, streamlit as st
 # ---------------------------
 st.set_page_config(page_title="❄️ SNOW챗봇 (Cortex Agents)", page_icon="❄️", layout="wide")
 st.title("❄️ SNOW챗봇 - Cortex Agents (Cloud)")
-st.caption("Cortex Search for calls · Analyst for metrics · Persistent chat")
+st.caption("Cortex Search for calls · Analyst for metrics · Persistent chat (JSON only)")
 
 # ---------------------------
 # Secrets (Streamlit Cloud의 secrets.toml)
 # ---------------------------
 SF = st.secrets["snowflake"]
-ACCOUNT_BASE = SF["account_base"].rstrip("/")  # Agents(regionless): https://qnehhfk-rub23142.snowflakecomputing.com
-SQL_BASE     = SF["sql_base"].rstrip("/")      # SQL(regional):    https://hgb46705.snowflakecomputing.com
+ACCOUNT_BASE = SF["account_base"].rstrip("/")  # Agents(regionless): https://qnehhfk-<acct>.snowflakecomputing.com
+SQL_BASE     = SF["sql_base"].rstrip("/")      # SQL(regional):    https://<account_locator>.snowflakecomputing.com
 PAT          = SF["pat"]                       # Programmatic Access Token
 ROLE         = SF.get("role", "SALES_INTELLIGENCE_RL")
 WAREHOUSE    = SF.get("warehouse", "SALES_INTELLIGENCE_WH")
@@ -119,7 +119,7 @@ def run_sql_rest(sql: str, timeout_s: int = 60) -> pd.DataFrame | None:
         return None
 
 # ---------------------------
-# 텍스트 정리 + SSE/JSON 파서
+# 텍스트 정리 + JSON 파서
 # ---------------------------
 def _normalize_text(s: str) -> str:
     s = s.replace("\r\n", "\n")
@@ -171,32 +171,10 @@ def parse_json_response(obj: dict):
     text = _normalize_text("".join(text_parts))
     return text, sql_holder["v"], citations
 
-def parse_events_response(events: list):
-    text_parts, citations = [], []
-    sql_holder = {"v": None}
-    def set_sql(v):
-        if v and isinstance(v,str) and v.strip() and not sql_holder["v"]:
-            sql_holder["v"] = v
-    for ev in events:
-        if not isinstance(ev, dict): continue
-        if ev.get("event") == "message.delta":
-            delta = ev.get("data",{}).get("delta",{})
-            content = delta.get("content") or []
-            if isinstance(content, dict): content = [content]
-            for item in content:
-                if item.get("type") == "text":
-                    t = item.get("text")
-                    if isinstance(t,str): text_parts.append(t)
-                elif item.get("type") == "tool_results":
-                    for r in item.get("tool_results",{}).get("content",[]):
-                        _pull_from_tool_result(r, citations, set_sql)
-    text = _normalize_text("".join(text_parts))
-    return text, sql_holder["v"], citations
-
 def parse_any(resp):
     if resp is None: return "", None, []
     if isinstance(resp, dict):  return parse_json_response(resp)
-    if isinstance(resp, list):  return parse_events_response(resp)
+    # (JSON 강제라 list/SSE는 기대하지 않음 — 예외적으로 오면 빈 처리)
     return "", None, []
 
 # ---------------------------
@@ -219,7 +197,7 @@ def detect_intent(q: str) -> str:
     return "Auto"
 
 # ---------------------------
-# Agents REST 호출
+# Agents REST 호출 (JSON 강제: stream=False + Accept: application/json)
 # ---------------------------
 def agent_headers():
     return {
@@ -229,7 +207,7 @@ def agent_headers():
         "X-Snowflake-Database": DATABASE,
         "X-Snowflake-Schema": SCHEMA,
         "X-Snowflake-Warehouse": WAREHOUSE,
-        "Accept": "application/json, text/event-stream",
+        "Accept": "application/json",          # ✅ JSON만 받기
         "Content-Type": "application/json",
     }
 
@@ -269,6 +247,7 @@ def build_payload(user_text: str, max_results: int = 5) -> dict:
         ],
         "tools": tools,
         "tool_resources": tool_resources,
+        "stream": False,                     # ✅ 스트리밍 끔 → JSON 보장
     }
 
 def call_agents(payload: dict, timeout=90):
@@ -279,40 +258,12 @@ def call_agents(payload: dict, timeout=90):
         st.error(f"HTTP {r.status_code} - {r.reason}")
         st.code(r.text[:2000] or "<empty>", language="json")
         return None
-    # JSON or SSE 모두 수용
-    if "application/json" in ctype:
-        try:
-            return r.json()
-        except Exception:
-            st.error("JSON 파싱 실패 → Raw 바디 앞부분 표시")
-            st.code(r.text[:2000] or "<empty>", language="json")
-            return None
-    # text/event-stream 전체가 텍스트로 전달되면 라인 파싱 없이 이벤트 배열로 치환
-    if "text/event-stream" in ctype or r.text.startswith("event:") or "\ndata:" in r.text:
-        # 간단 SSE → message.delta 이벤트만 추출
-        events, cur_event, data_lines = [], None, []
-        for line in r.text.splitlines() + [""]:
-            if line.startswith("event:"):
-                if cur_event is not None:
-                    data_str = "\n".join(data_lines).strip()
-                    try: data_json = json.loads(data_str) if data_str else {}
-                    except: data_json = {"raw": data_str}
-                    # message.delta로 정규화
-                    events.append({"event": "message.delta", "data": {"delta": data_json}})
-                cur_event, data_lines = line.split("event:", 1)[1].strip(), []
-            elif line.startswith("data:"):
-                data_lines.append(line[5:].strip())
-            elif line.strip() == "" and cur_event is not None:
-                data_str = "\n".join(data_lines).strip()
-                try: data_json = json.loads(data_str) if data_str else {}
-                except: data_json = {"raw": data_str}
-                events.append({"event": "message.delta", "data": {"delta": data_json}})
-                cur_event, data_lines = None, []
-        return events
-    # unknown
-    st.error("알 수 없는 응답 형식 → Raw 바디 앞부분 표시")
-    st.code(r.text[:2000] or "<empty>")
-    return None
+    try:
+        return r.json()
+    except Exception:
+        st.error("JSON 파싱 실패 → Raw 바디 앞부분 표시")
+        st.code(r.text[:2000] or "<empty>", language="json")
+        return None
 
 # ---------------------------
 # Chat state (히스토리 보존: 표/인용 전문까지 저장)
@@ -349,7 +300,39 @@ with st.spinner("Calling Cortex Agents..."):
 
 text, sql, citations = parse_any(resp)
 
+# ---------------------------
+# 폴백(에이전트가 텍스트/SQL을 안 줄 때)
+# ---------------------------
+def _extract_rep_name(q: str) -> str | None:
+    m = re.search(r"\b([A-Z][a-z]+ [A-Z][a-z]+)\b", q or "")
+    return m.group(1) if m else None
+
+def _fallback_wonlost(q: str) -> tuple[str, pd.DataFrame | None]:
+    """질문이 'won/lost' 류면 직접 SQL 실행."""
+    rep = _extract_rep_name(q) or "Sarah Johnson"
+    sql_fb = f"""
+    SELECT
+      win_status,
+      COUNT(*) AS deal_count,
+      MIN(close_date) AS start_date,
+      MAX(close_date) AS end_date
+    FROM SALES_INTELLIGENCE.DATA.SALES_METRICS
+    WHERE UPPER(sales_rep) = UPPER('{rep.replace("'", "''")}')
+    GROUP BY win_status
+    ORDER BY win_status DESC NULLS LAST
+    """
+    return rep, run_sql_rest(sql_fb, timeout_s=60)
+
+intent = detect_intent(query)
+if not text and not sql and intent in ("SQL","Auto") and ("won" in query.lower() or "lost" in query.lower()):
+    rep, df_fb = _fallback_wonlost(query)
+    if df_fb is not None and not df_fb.empty:
+        sql = f"-- fallback\n{qualify_sql('select ... (see above)')}"
+        text = f"(fallback) **{rep}** → won/lost breakdown from SALES_METRICS."
+
+# ---------------------------
 # 어시스턴트 메시지 구성 + 첨부를 함께 저장
+# ---------------------------
 assistant_chunks, tables_to_persist, expanders_to_persist = [], [], []
 
 if text:
@@ -368,7 +351,17 @@ if sql:
                 "title": "Query Result",
                 "data": df_safe.to_dict(orient="records")
             })
-            assistant_chunks.append(f"_Query returned **{len(df)}** row(s)._")
+            # win/lost 요약 자동화
+            cols_lower = [c.lower() for c in df.columns]
+            if "win_status" in cols_lower and ("deal_count" in cols_lower or "count" in cols_lower):
+                win_col = df.columns[cols_lower.index("win_status")]
+                cnt_col = "deal_count" if "deal_count" in cols_lower else df.columns[cols_lower.index("count")]
+                try:
+                    won  = int(df[df[win_col] == True ][cnt_col].sum())
+                    lost = int(df[df[win_col] == False][cnt_col].sum())
+                    assistant_chunks.append(f"**Summary → Won: `{won}` / Lost(or not-won): `{lost}`**")
+                except Exception:
+                    pass
 
 # Citations → 전문 미리보기도 즉시 조회하고 저장(차후 리렌더링 시 재조회 없음)
 if citations:
@@ -385,7 +378,6 @@ if citations:
         """
         dfp = run_sql_rest(preview_sql, timeout_s=60)
         if dfp is None or dfp.empty:
-            # 실패해도 앱은 계속
             continue
         row = dfp.iloc[0].to_dict()
         header = f"[{row.get('CONVERSATION_ID','')}] {row.get('CUSTOMER_NAME','')} · {row.get('SALES_REP','')} · {row.get('DEAL_STAGE','')} · {row.get('CONVERSATION_DATE','')}"
